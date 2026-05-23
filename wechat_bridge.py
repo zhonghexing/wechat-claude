@@ -33,7 +33,7 @@ if sys.stdout.encoding != 'utf-8':
 # ---------- 配置 ----------
 CLAUDE_CLI = r"C:\Users\zhx\Desktop\CC\nodejs\node-v20.11.0-win-x64\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
 WORK_DIR = r"D:\claude自动"
-CHECK_INTERVAL = 0.5
+CHECK_INTERVAL = 0.3
 MAX_RESPONSE_LENGTH = 500
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_CONSOLE = 0x00000010
@@ -84,27 +84,27 @@ def ensure_window_visible(control):
             return False
         if ctypes.windll.user32.IsIconic(hwnd):
             ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
-            time.sleep(0.15)
+            time.sleep(0.05)
         if ctypes.windll.user32.GetForegroundWindow() != hwnd:
             ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
-            time.sleep(0.02)
+            time.sleep(0.01)
             ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
-            time.sleep(0.02)
+            time.sleep(0.01)
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW)
-        time.sleep(0.1)
+        time.sleep(0.03)
         return True
     except:
         return False
 
 
 def ensure_wechat_ready(wechat):
-    if not wechat or not wechat.Exists(0, 0.3):
+    if not wechat or not wechat.Exists(0, 0.2):
         return False
     try:
         ensure_window_visible(wechat)
         wechat.SetActive()
-        time.sleep(0.1)
+        time.sleep(0.05)
         return True
     except:
         return False
@@ -215,7 +215,7 @@ def open_chat(wechat, chat_name):
                 close_btn = standalone.Control(Name='关闭')
                 if close_btn.Exists(0, 0.3):
                     close_btn.Click()
-                    time.sleep(0.2)
+                    time.sleep(0.1)
             except:
                 pass
 
@@ -223,19 +223,19 @@ def open_chat(wechat, chat_name):
         return True
 
     chat_tab = wechat.Control(Name='微信', ClassName='mmui::XTabBarItem')
-    if chat_tab.Exists(0, 0.3):
+    if chat_tab.Exists(0, 0.2):
         chat_tab.Click()
-        time.sleep(0.15)
+        time.sleep(0.08)
 
     if is_chat_open(wechat, chat_name):
         return True
 
     session_list = wechat.Control(AutomationId='session_list')
-    if session_list.Exists(0, 0.5):
+    if session_list.Exists(0, 0.3):
         cell = find_child_by_autoid(session_list, f"session_item_{chat_name}")
         if cell:
             cell.Click()
-            time.sleep(0.8)
+            time.sleep(0.5)
             if not is_chat_open(wechat, chat_name):
                 standalone = auto.WindowControl(Name=chat_name)
                 if standalone.Exists(0, 0.3):
@@ -269,15 +269,15 @@ def send_message(wechat, message):
     except:
         rect = input_field.BoundingRectangle
         auto.Click(rect.left + 50, rect.top + 10)
-    time.sleep(0.1)
+    time.sleep(0.05)
 
     # 用剪贴板粘贴，避免 SendKeys 逐字打字丢字符
     subprocess.run('clip', input=message, text=True, shell=True,
                    creationflags=CREATE_NO_WINDOW)
     auto.SendKeys('{Ctrl}a')
-    time.sleep(0.03)
+    time.sleep(0.02)
     auto.SendKeys('{Ctrl}v')
-    time.sleep(0.05)
+    time.sleep(0.03)
     auto.SendKeys('{Enter}')
     return True
 
@@ -366,11 +366,9 @@ def call_claude(prompt):
     global _session_started
     try:
         if _session_started:
-            # 继续上次会话，保持上下文
-            args = [CLAUDE_CLI, '--continue', '-p', prompt, '--permission-mode', 'bypassPermissions']
+            args = [CLAUDE_CLI, '--continue', '-p', prompt, '--permission-mode', 'bypassPermissions', '--effort', 'low']
         else:
-            # 首次调用，开始新会话
-            args = [CLAUDE_CLI, '-p', prompt, '--permission-mode', 'bypassPermissions']
+            args = [CLAUDE_CLI, '-p', prompt, '--permission-mode', 'bypassPermissions', '--effort', 'low']
             _session_started = True
 
         # 最小化启动 Claude
@@ -422,7 +420,7 @@ def run_bridge(chat_name="文件传输助手"):
     def mark_processed(wechat, chat_name):
         """更新基准，防止自己的回复被误判为新消息"""
         nonlocal last_fingerprint, last_processed_text
-        time.sleep(0.3)
+        time.sleep(0.15)
         fp = get_cell_fingerprint(wechat, chat_name)
         text = get_last_message_text(wechat, chat_name)
         if fp:
@@ -511,11 +509,6 @@ def run_bridge(chat_name="文件传输助手"):
                 session_tag = "[新会话]" if not _session_started else "[延续]"
                 print(f"  -> {session_tag} 指令: {current}")
 
-                ensure_wechat_ready(wechat)
-                open_chat(wechat, chat_name)
-                send_message(wechat, f"(执行中...) {current[:50]}")
-                mark_processed(wechat, chat_name)
-
                 handled, local_result = dispatch_local(current)
                 if handled:
                     result = local_result
@@ -525,7 +518,7 @@ def run_bridge(chat_name="文件传输助手"):
 
                 ensure_wechat_ready(wechat)
                 open_chat(wechat, chat_name)
-                time.sleep(0.1)
+                time.sleep(0.05)
                 send_message(wechat, result)
                 mark_processed(wechat, chat_name)
 
