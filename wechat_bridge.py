@@ -3,11 +3,9 @@
 通过微信文件传输助手远程控制 Claude Code 执行任务。
 
 通信协议:
-  单条命令: claude <任务内容> stop
-  多行命令: claude
-            <任务内容第1行>
-            <任务内容第2行>
-            stop
+  发送 "claude" 进入指令模式
+  之后每条消息作为独立指令执行
+  发送 "claude" / "exit" / "退出" 退出指令模式
 
 用法:
   python wechat_bridge.py                          # 默认监控文件传输助手
@@ -35,7 +33,7 @@ if sys.stdout.encoding != 'utf-8':
 # ---------- 配置 ----------
 CLAUDE_CLI = r"C:\Users\zhx\Desktop\CC\nodejs\node-v20.11.0-win-x64\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
 WORK_DIR = r"D:\claude自动"
-CHECK_INTERVAL = 2
+CHECK_INTERVAL = 0.5
 MAX_RESPONSE_LENGTH = 500
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_CONSOLE = 0x00000010
@@ -45,8 +43,8 @@ SW_SHOW = 5
 
 # ---------- 状态机 ----------
 STATE_IDLE = "idle"            # 静默监控中
-STATE_COLLECT = "collect"      # 收到 claude，等待 stop
-STATE_EXECUTE = "execute"      # 收到完整指令，执行中
+STATE_ACTIVE = "active"        # 指令模式，每条消息当指令执行
+STATE_EXECUTE = "execute"      # 执行中
 
 # ---------- 单实例锁 ----------
 
@@ -86,15 +84,15 @@ def ensure_window_visible(control):
             return False
         if ctypes.windll.user32.IsIconic(hwnd):
             ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
-            time.sleep(0.3)
+            time.sleep(0.15)
         if ctypes.windll.user32.GetForegroundWindow() != hwnd:
             ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
-            time.sleep(0.05)
+            time.sleep(0.02)
             ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
-            time.sleep(0.05)
+            time.sleep(0.02)
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW)
-        time.sleep(0.2)
+        time.sleep(0.1)
         return True
     except:
         return False
@@ -106,7 +104,7 @@ def ensure_wechat_ready(wechat):
     try:
         ensure_window_visible(wechat)
         wechat.SetActive()
-        time.sleep(0.2)
+        time.sleep(0.1)
         return True
     except:
         return False
@@ -155,11 +153,19 @@ def get_wechat():
 
 
 def get_last_message_text(wechat, chat_name):
+    import re as _re
     info = get_chat_cell_info(wechat, chat_name)
     if info:
         parts = info['name'].split('\n')
-        if len(parts) >= 2:
-            return parts[1].strip()
+        for part in parts[1:]:
+            part = part.strip()
+            if not part:
+                continue
+            if _re.match(r'^\[\d+条\]$', part):
+                continue
+            if _re.match(r'^\d{1,2}:\d{2}$', part):
+                continue
+            return part
     return None
 
 
@@ -197,7 +203,7 @@ def open_chat(wechat, chat_name):
                 close_btn = standalone.Control(Name='关闭')
                 if close_btn.Exists(0, 0.3):
                     close_btn.Click()
-                    time.sleep(0.5)
+                    time.sleep(0.2)
             except:
                 pass
 
@@ -207,7 +213,7 @@ def open_chat(wechat, chat_name):
     chat_tab = wechat.Control(Name='微信', ClassName='mmui::XTabBarItem')
     if chat_tab.Exists(0, 0.3):
         chat_tab.Click()
-        time.sleep(0.3)
+        time.sleep(0.15)
 
     if is_chat_open(wechat, chat_name):
         return True
@@ -217,19 +223,19 @@ def open_chat(wechat, chat_name):
         cell = find_child_by_autoid(session_list, f"session_item_{chat_name}")
         if cell:
             cell.Click()
-            time.sleep(1.5)
+            time.sleep(0.8)
             if not is_chat_open(wechat, chat_name):
                 standalone = auto.WindowControl(Name=chat_name)
                 if standalone.Exists(0, 0.3):
                     close_btn = standalone.Control(Name='关闭')
                     if close_btn.Exists(0, 0.3):
                         close_btn.Click()
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     ensure_wechat_ready(wechat)
                     cell = wechat.Control(AutomationId=f"session_item_{chat_name}")
                     if cell.Exists(0, 1):
                         cell.Click()
-                        time.sleep(1.5)
+                        time.sleep(0.8)
             return is_chat_open(wechat, chat_name)
     return False
 
@@ -251,11 +257,15 @@ def send_message(wechat, message):
     except:
         rect = input_field.BoundingRectangle
         auto.Click(rect.left + 50, rect.top + 10)
-    time.sleep(0.3)
-    auto.SendKeys('{Ctrl}a')
     time.sleep(0.1)
-    auto.SendKeys(message)
-    time.sleep(0.2)
+
+    # 用剪贴板粘贴，避免 SendKeys 逐字打字丢字符
+    subprocess.run('clip', input=message, text=True, shell=True,
+                   creationflags=CREATE_NO_WINDOW)
+    auto.SendKeys('{Ctrl}a')
+    time.sleep(0.03)
+    auto.SendKeys('{Ctrl}v')
+    time.sleep(0.05)
     auto.SendKeys('{Enter}')
     return True
 
@@ -351,12 +361,16 @@ def call_claude(prompt):
             args = [CLAUDE_CLI, '-p', prompt, '--permission-mode', 'bypassPermissions']
             _session_started = True
 
-        # 指令执行时自动弹出终端窗口，平时桥接在后台
+        # 最小化启动 Claude
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 6  # SW_MINIMIZE
         result = subprocess.run(
             args,
             capture_output=True, text=True, timeout=300,
             cwd=WORK_DIR, encoding='utf-8', errors='replace',
-            creationflags=CREATE_NEW_CONSOLE,  # 自动弹出窗口显示执行过程
+            creationflags=CREATE_NEW_CONSOLE,
+            startupinfo=startupinfo,
         )
         output = result.stdout.strip()
         if result.stderr:
@@ -380,7 +394,6 @@ def run_bridge(chat_name="文件传输助手"):
 
     wechat = None
     state = STATE_IDLE
-    collected_parts = []
     last_seen = None
     last_processed = None
 
@@ -389,7 +402,7 @@ def run_bridge(chat_name="文件传输助手"):
     print(f"  监控对象: {chat_name}")
     print(f"  收到指令时自动弹出 Claude 终端窗口")
     print()
-    print("状态机: IDLE → (收到claude) → COLLECT → (收到stop) → EXECUTE → IDLE")
+    print("状态机: IDLE → (收到claude) → ACTIVE → (每条消息=指令) → EXECUTE → ACTIVE")
     print("按 Ctrl+C 停止")
     print("=" * 60)
     print()
@@ -397,11 +410,16 @@ def run_bridge(chat_name="文件传输助手"):
     def mark_processed(wechat, chat_name):
         """更新基准，防止自己的回复被误判为新消息"""
         nonlocal last_seen, last_processed
-        time.sleep(1)
+        time.sleep(0.3)
         current = get_last_message_text(wechat, chat_name)
         if current:
             last_seen = current
             last_processed = current
+
+    # 初始化 last_seen，跳过启动前的旧消息
+    tmp_wechat = get_wechat()
+    if tmp_wechat:
+        last_seen = get_last_message_text(tmp_wechat, chat_name)
 
     try:
         while True:
@@ -425,120 +443,70 @@ def run_bridge(chat_name="文件传输助手"):
 
             print(f"[{time.strftime('%H:%M:%S')}] [{state}] 收到: {current}")
 
-            # --- IDLE 状态：等待 claude 指令 ---
+            # --- IDLE 状态：等待 claude 进入指令模式 ---
             if state == STATE_IDLE:
-                valid, cmd = is_valid_command(current)
-                if valid:
-                    # 检查是否是重置会话指令
-                    if cmd.strip() in ('重置', '重置会话', '新会话', 'reset', 'new'):
-                        reset_session()
-                        ensure_wechat_ready(wechat)
-                        send_message(wechat, "会话已重置，下次指令将开始新对话。")
-                        mark_processed(wechat, chat_name)
-                        print(f"  -> 会话已重置")
-                        continue
-
-                    # 确认是有效指令 → 进入执行
-                    state = STATE_EXECUTE
-                    session_tag = "[新会话]" if not _session_started else "[延续]"
-                    print(f"  -> {session_tag} 确认指令: {cmd}")
+                if is_claude_start(current) and not extract_command(current):
+                    # 单独一条 "claude" → 进入指令模式
+                    state = STATE_ACTIVE
+                    print(f"  -> 进入指令模式")
 
                     ensure_wechat_ready(wechat)
-                    send_message(wechat, f"(执行中...) {cmd[:50]}")
+                    send_message(wechat, "(已进入指令模式，每条消息将作为指令执行。发送 claude 或 exit 退出)")
                     mark_processed(wechat, chat_name)
 
-                    # 先尝试本地快捷指令（如酷狗播放），失败则走 Claude
-                    handled, local_result = dispatch_local(cmd)
-                    if handled:
-                        result = local_result
-                        print(f"  -> 本地指令: {result[:60]}")
-                    else:
-                        result = call_claude(cmd)
-
+            # --- ACTIVE 状态：每条消息 = 一条指令 ---
+            elif state == STATE_ACTIVE:
+                # 退出指令模式
+                if is_claude_start(current) and not extract_command(current):
+                    print(f"  -> 退出指令模式，回到 IDLE")
                     ensure_wechat_ready(wechat)
-                    open_chat(wechat, chat_name)
-                    time.sleep(0.5)
-                    send_message(wechat, result)
+                    send_message(wechat, "(已退出指令模式)")
                     mark_processed(wechat, chat_name)
-
-                    print(f"  -> 已回复，回到 IDLE")
                     state = STATE_IDLE
+                    continue
 
-                elif is_claude_start(current):
-                    # 有 claude 但没 stop → 进入多行收集
-                    state = STATE_COLLECT
-                    collected_parts = []
-                    cmd_part = extract_command(current)
-                    if cmd_part:
-                        collected_parts.append(cmd_part)
-                    print(f"  -> 进入收集模式，等待 stop...")
-
+                cmd_lower = current.lower().strip()
+                if cmd_lower in ('exit', '退出', 'quit'):
+                    print(f"  -> 退出指令模式，回到 IDLE")
                     ensure_wechat_ready(wechat)
-                    send_message(wechat, "(收到指令头，请继续发送内容，以 stop 结束)")
+                    send_message(wechat, "(已退出指令模式)")
                     mark_processed(wechat, chat_name)
-
-                else:
-                    # 不是 claude 指令，忽略
-                    pass
-
-            # --- COLLECT 状态：收集中，等待 stop ---
-            elif state == STATE_COLLECT:
-                if is_claude_stop(current):
-                    cmd_part = extract_command(current)
-                    if cmd_part:
-                        collected_parts.append(cmd_part)
-
-                    full_cmd = ' '.join(collected_parts)
-                    if not full_cmd.strip():
-                        print(f"  -> 空指令，回到 IDLE")
-                        state = STATE_IDLE
-                        continue
-
-                    # 检查是否是重置指令
-                    if full_cmd.strip() in ('重置', '重置会话', '新会话', 'reset', 'new'):
-                        reset_session()
-                        ensure_wechat_ready(wechat)
-                        send_message(wechat, "会话已重置，下次指令将开始新对话。")
-                        mark_processed(wechat, chat_name)
-                        print(f"  -> 会话已重置")
-                        state = STATE_IDLE
-                        continue
-
-                    state = STATE_EXECUTE
-                    session_tag = "[新会话]" if not _session_started else "[延续]"
-                    print(f"  -> {session_tag} 完整指令: {full_cmd}")
-
-                    ensure_wechat_ready(wechat)
-                    send_message(wechat, "(执行中...请稍候)")
-                    mark_processed(wechat, chat_name)
-
-                    handled, local_result = dispatch_local(full_cmd)
-                    if handled:
-                        result = local_result
-                        print(f"  -> 本地指令: {result[:60]}")
-                    else:
-                        result = call_claude(full_cmd)
-
-                    ensure_wechat_ready(wechat)
-                    open_chat(wechat, chat_name)
-                    time.sleep(0.5)
-                    send_message(wechat, result)
-                    mark_processed(wechat, chat_name)
-
-                    print(f"  -> 已回复，回到 IDLE")
                     state = STATE_IDLE
+                    continue
 
-                elif is_claude_start(current):
-                    # 又收到一个 claude → 可能是新的指令，重置收集
-                    print(f"  -> 收到新的 claude，重置收集")
-                    collected_parts = []
-                    cmd_part = extract_command(current)
-                    if cmd_part:
-                        collected_parts.append(cmd_part)
+                # 检查是否是重置指令
+                if current.strip() in ('重置', '重置会话', '新会话', 'reset', 'new'):
+                    reset_session()
+                    ensure_wechat_ready(wechat)
+                    send_message(wechat, "(会话已重置，下次指令将开始新对话)")
+                    mark_processed(wechat, chat_name)
+                    print(f"  -> 会话已重置")
+                    continue
 
+                # 执行指令
+                state = STATE_EXECUTE
+                session_tag = "[新会话]" if not _session_started else "[延续]"
+                print(f"  -> {session_tag} 指令: {current}")
+
+                ensure_wechat_ready(wechat)
+                send_message(wechat, f"(执行中...) {current[:50]}")
+                mark_processed(wechat, chat_name)
+
+                handled, local_result = dispatch_local(current)
+                if handled:
+                    result = local_result
+                    print(f"  -> 本地指令: {result[:60]}")
                 else:
-                    collected_parts.append(current)
-                    print(f"  -> 收集片段 ({len(collected_parts)}): {current[:60]}")
+                    result = call_claude(current)
+
+                ensure_wechat_ready(wechat)
+                open_chat(wechat, chat_name)
+                time.sleep(0.1)
+                send_message(wechat, result)
+                mark_processed(wechat, chat_name)
+
+                print(f"  -> 已回复，继续等待指令")
+                state = STATE_ACTIVE
 
             # --- EXECUTE 状态不应该持续到下一轮 ---
             elif state == STATE_EXECUTE:
