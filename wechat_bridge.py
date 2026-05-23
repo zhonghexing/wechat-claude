@@ -258,6 +258,15 @@ def _set_clipboard_unicode(text):
     GMEM_MOVEABLE = 0x0002
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+
+    # 64 位 Windows 上必须声明 restype/argtypes，否则句柄当 32 位 int 会溢出
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
     user32.OpenClipboard(0)
     user32.EmptyClipboard()
     size = (len(text) + 1) * 2
