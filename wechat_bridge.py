@@ -252,6 +252,23 @@ def open_chat(wechat, chat_name):
     return False
 
 
+def _set_clipboard_unicode(text):
+    """用 Win32 CF_UNICODETEXT 写剪贴板，避免 clip.exe 的 GBK 编码问题"""
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard(0)
+    user32.EmptyClipboard()
+    size = (len(text) + 1) * 2
+    hMem = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+    ptr = kernel32.GlobalLock(hMem)
+    ctypes.cdll.msvcrt.wcscpy(ctypes.c_void_p(ptr), text)
+    kernel32.GlobalUnlock(hMem)
+    user32.SetClipboardData(CF_UNICODETEXT, hMem)
+    user32.CloseClipboard()
+
+
 def send_message(wechat, message):
     if not ensure_wechat_ready(wechat):
         return False
@@ -271,9 +288,9 @@ def send_message(wechat, message):
         auto.Click(rect.left + 50, rect.top + 10)
     time.sleep(0.05)
 
-    # 用剪贴板粘贴，避免 SendKeys 逐字打字丢字符
-    subprocess.run('clip', input=message, text=True, shell=True,
-                   creationflags=CREATE_NO_WINDOW)
+    # 用 Win32 CF_UNICODETEXT 写剪贴板，支持全部 Unicode 字符
+    # 不能用 clip.exe——它在中文 Windows 上是 GBK 编码，遇到 ↔ 等字符会崩溃
+    _set_clipboard_unicode(message)
     auto.SendKeys('{Ctrl}a')
     time.sleep(0.02)
     auto.SendKeys('{Ctrl}v')
