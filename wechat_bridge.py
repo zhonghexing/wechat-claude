@@ -19,6 +19,7 @@ import subprocess
 import os
 import re
 import ctypes
+import hashlib
 
 try:
     import uiautomation as auto
@@ -41,33 +42,119 @@ LOCK_FILE = os.path.join(WORK_DIR, ".bridge_lock")
 SW_RESTORE = 9
 SW_SHOW = 5
 
+# 微信 4.x 文件存储路径
+WECHAT_DATA_DIR = r"C:\Users\zhx\xwechat_files\wxid_tam2qey51fy722_9836"
+WECHAT_FILE_DIR = os.path.join(WECHAT_DATA_DIR, "msg", "file")
+
+# 消息类型
+MSG_TEXT = 'text'
+MSG_IMAGE = 'image'
+MSG_FILE = 'file'
+
 # ---------- 状态机 ----------
 STATE_IDLE = "idle"            # 静默监控中
 STATE_ACTIVE = "active"        # 指令模式，每条消息当指令执行
 STATE_EXECUTE = "execute"      # 执行中
 
-# ---------- 单实例锁 ----------
+# ---------- 单实例锁 + 旧进程清理 ----------
+
+CLAUDE_PID_FILE = os.path.join(WORK_DIR, ".claude_pids")
+
+# 当前桥接实例启动后才创建的 Claude 子进程 PID（用于正常退出时精确清理）
+_my_claude_pids = []
+
+
+def cleanup_stale_claude():
+    """启动时：杀死上次桥接残留的所有 Claude 子进程"""
+    if not os.path.exists(CLAUDE_PID_FILE):
+        return
+    killed = 0
+    try:
+        with open(CLAUDE_PID_FILE, 'r') as f:
+            pids = [line.strip() for line in f if line.strip()]
+        kernel32 = ctypes.windll.kernel32
+        for pid_str in pids:
+            try:
+                pid = int(pid_str)
+                h = kernel32.OpenProcess(0x0001, False, pid)
+                if h:
+                    kernel32.TerminateProcess(h, 0)
+                    kernel32.CloseHandle(h)
+                    killed += 1
+            except:
+                pass
+    except:
+        pass
+    try:
+        os.remove(CLAUDE_PID_FILE)
+    except:
+        pass
+    if killed:
+        print(f"已清理 {killed} 个残留 Claude 子进程")
+
+
+def track_claude_pid(pid):
+    """记录 Claude 子进程 PID，以便异常退出后清理"""
+    _my_claude_pids.append(pid)
+    try:
+        with open(CLAUDE_PID_FILE, 'a') as f:
+            f.write(f"{pid}\n")
+    except:
+        pass
+
+
+def untrack_claude_pid(pid):
+    """Claude 正常退出后移除 PID 记录"""
+    if pid in _my_claude_pids:
+        _my_claude_pids.remove(pid)
+
+
+def kill_my_claude():
+    """退出时：清理当前桥接实例创建的所有 Claude 子进程"""
+    for pid in _my_claude_pids:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(0x0001, False, pid)
+            if h:
+                kernel32.TerminateProcess(h, 0)
+                kernel32.CloseHandle(h)
+        except:
+            pass
+    _my_claude_pids.clear()
+    try:
+        if os.path.exists(CLAUDE_PID_FILE):
+            os.remove(CLAUDE_PID_FILE)
+    except:
+        pass
+
 
 def acquire_lock():
+    """获取单实例锁，如发现旧桥接进程则自动杀死并接管"""
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, 'r') as f:
                 old_pid = int(f.read().strip())
             kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x0400, False, old_pid)
-            if handle:
-                kernel32.CloseHandle(handle)
-                print(f"桥接已在运行中 (PID: {old_pid})，无需重复启动。")
-                return False
+            h = kernel32.OpenProcess(0x0001, False, old_pid)
+            if h:
+                kernel32.TerminateProcess(h, 0)
+                kernel32.CloseHandle(h)
+                print(f"已终止旧桥接进程 (PID: {old_pid})")
+                time.sleep(0.5)
         except:
             pass
-        os.remove(LOCK_FILE)
+        try:
+            os.remove(LOCK_FILE)
+        except:
+            pass
+    cleanup_stale_claude()
     with open(LOCK_FILE, 'w') as f:
         f.write(str(os.getpid()))
     return True
 
 
 def release_lock():
+    kill_my_claude()
     try:
         if os.path.exists(LOCK_FILE):
             os.remove(LOCK_FILE)
@@ -181,6 +268,18 @@ def get_cell_fingerprint(wechat, chat_name):
     return None
 
 
+def get_message_type(wechat, chat_name):
+    """检测最新消息的类型: MSG_TEXT / MSG_IMAGE / MSG_FILE，返回 (text, type)"""
+    text = get_last_message_text(wechat, chat_name)
+    if not text:
+        return None, None
+    if text == '[图片]':
+        return text, MSG_IMAGE
+    if text == '[文件]':
+        return text, MSG_FILE
+    return text, MSG_TEXT
+
+
 def get_chat_cell_info(wechat, chat_name):
     session_list = wechat.Control(AutomationId='session_list')
     if not session_list.Exists(0, 0.3):
@@ -278,7 +377,143 @@ def _set_clipboard_unicode(text):
     user32.CloseClipboard()
 
 
+def capture_images_from_chat(wechat):
+    """在聊天窗口中找到最新图片并截图保存，返回路径列表"""
+    import pyautogui as _pg
+    if not ensure_wechat_ready(wechat):
+        return []
+    detail = wechat.Control(ClassName='mmui::ChatDetailView')
+    if not detail.Exists(0, 0.3):
+        return []
+    # 滚动到底部
+    auto.SendKeys('{End}')
+    time.sleep(0.3)
+    # 递归查找 ImageControl
+    all_images = []
+    def _collect(ctrl, depth=0):
+        if depth > 25:
+            return
+        try:
+            if ctrl.ControlTypeName == 'ImageControl':
+                rect = ctrl.BoundingRectangle
+                w, h = rect.width(), rect.height()
+                if 30 < w < 2000 and 30 < h < 2000:
+                    all_images.append(ctrl)
+            for child in ctrl.GetChildren():
+                _collect(child, depth + 1)
+        except:
+            pass
+    _collect(detail)
+    if not all_images:
+        return []
+    recent = all_images[-3:]  # 最多 3 张
+    saved = []
+    ts = int(time.time())
+    for i, ctrl in enumerate(recent):
+        rect = ctrl.BoundingRectangle
+        try:
+            img = _pg.screenshot(region=(rect.left, rect.top,
+                                         max(rect.width(), 1), max(rect.height(), 1)))
+            path = os.path.join(WORK_DIR, f"_wechat_img_{ts}_{i}.png")
+            img.save(path)
+            saved.append(path)
+        except Exception as _e:
+            print(f"  [WARN] 截图失败: {_e}")
+    return saved
+
+
+def find_latest_files(n=3):
+    """查找微信文件存储目录中最新的 n 个文件"""
+    month = time.strftime('%Y-%m')
+    file_dir = os.path.join(WECHAT_FILE_DIR, month)
+    if not os.path.isdir(file_dir):
+        return []
+    files = []
+    for f in os.listdir(file_dir):
+        fp = os.path.join(file_dir, f)
+        if os.path.isfile(fp):
+            files.append((os.path.getmtime(fp), fp))
+    files.sort(key=lambda x: x[0], reverse=True)
+    return [f[1] for f in files[:n]]
+
+
+def _set_clipboard_file(filepath):
+    """用 Win32 CF_HDROP 写剪贴板，比 PowerShell 快 10 倍（省掉进程启动）"""
+    CF_HDROP = 15
+    GMEM_MOVEABLE = 0x0002
+
+    class DROPFILES(ctypes.Structure):
+        _fields_ = [("pFiles", ctypes.c_uint),
+                     ("pt", ctypes.c_long * 2),
+                     ("fNC", ctypes.c_int),
+                     ("fWide", ctypes.c_int)]
+
+    abs_path = os.path.abspath(filepath)
+    filedata = (abs_path + '\0\0').encode('utf-16-le')
+    df_size = ctypes.sizeof(DROPFILES)
+    total = df_size + len(filedata)
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+
+    user32.OpenClipboard(0)
+    user32.EmptyClipboard()
+    hMem = kernel32.GlobalAlloc(GMEM_MOVEABLE, total)
+    ptr = kernel32.GlobalLock(hMem)
+    df = DROPFILES()
+    df.pFiles = df_size
+    df.fWide = 1
+    ctypes.memmove(ptr, ctypes.addressof(df), df_size)
+    ctypes.memmove(ptr + df_size, filedata, len(filedata))
+    kernel32.GlobalUnlock(hMem)
+    user32.SetClipboardData(CF_HDROP, hMem)
+    user32.CloseClipboard()
+
+
+def send_file_to_wechat(wechat, filepath):
+    """通过剪贴板发送文件到微信聊天（Win32 CF_HDROP，无 PowerShell 启动延迟）"""
+    if not ensure_wechat_ready(wechat):
+        return False
+    _set_clipboard_file(filepath)
+    detail = wechat.Control(ClassName='mmui::ChatDetailView')
+    if not detail.Exists(0, 0.3):
+        return False
+    chat_page = find_child_by_class(detail, 'mmui::ChatMessagePage')
+    if not chat_page:
+        return False
+    inp = find_child_by_autoid(chat_page, 'chat_input_field')
+    if not inp:
+        return False
+    try:
+        inp.Click()
+    except:
+        r = inp.BoundingRectangle
+        auto.Click(r.left + 50, r.top + 10)
+    time.sleep(0.05)
+    auto.SendKeys('{Ctrl}v')
+    time.sleep(0.1)
+    auto.SendKeys('{Enter}')
+    return True
+_sent_cache = {}  # msg_hash → expire_time
+_SENT_CACHE_TTL = 3
+
+
 def send_message(wechat, message):
+    # 3 秒内完全相同的文本不重复发送（终极去重）
+    msg_hash = hashlib.md5(message.encode()).hexdigest()
+    now = time.time()
+    if msg_hash in _sent_cache and now < _sent_cache[msg_hash]:
+        return False
+    _sent_cache[msg_hash] = now + _SENT_CACHE_TTL
+    # 清理过期条目
+    for h in list(_sent_cache):
+        if _sent_cache[h] < now:
+            del _sent_cache[h]
+
     if not ensure_wechat_ready(wechat):
         return False
     detail = wechat.Control(ClassName='mmui::ChatDetailView')
@@ -303,8 +538,16 @@ def send_message(wechat, message):
     auto.SendKeys('{Ctrl}a')
     time.sleep(0.02)
     auto.SendKeys('{Ctrl}v')
-    time.sleep(0.03)
-    auto.SendKeys('{Enter}')
+    time.sleep(0.15)
+
+    # 微信可能"粘贴即发送"，此时输入框已被清空，不需要再按 Enter
+    # 否则会发两遍：一遍由粘贴触发，一遍由 Enter 触发
+    try:
+        remaining = (input_field.Name or '').strip()
+    except:
+        remaining = '?'
+    if remaining and remaining != '?':
+        auto.SendKeys('{Enter}')
     return True
 
 
@@ -349,11 +592,31 @@ def dispatch_local(cmd):
     """
     cmd_lower = cmd.lower().strip()
 
-    # 酷狗音乐播放
-    if ('酷狗' in cmd_lower or 'kugou' in cmd_lower) and '播放' in cmd_lower:
+    # 发送文件/图片
+    if cmd_lower.startswith('发文件') or cmd_lower.startswith('发图片') or \
+       cmd_lower.startswith('发送文件') or cmd_lower.startswith('发送图片'):
         import re as _re
-        # 提取歌名: "播放XXX" 或 "播放 XXX"
-        m = _re.search(r'播放\s*(.+?)(?:\s*$)', cmd)
+        m = _re.search(r'^发(?:送)?(?:文件|图片)\s+(.+?)(?:\s*stop)?\s*$', cmd)
+        if m:
+            fname = m.group(1).strip()
+            fpath = os.path.join(WORK_DIR, fname)
+            if not os.path.isfile(fpath):
+                fpath = fname  # 尝试绝对路径
+            if os.path.isfile(fpath):
+                return True, ('__SEND_FILE__', fpath)
+            else:
+                return True, f"文件不存在: {fname}"
+
+    # 酷狗音乐播放 — 仅处理"纯播放"指令，混合其他操作的交给 Claude 完整理解
+    if ('酷狗' in cmd_lower or 'kugou' in cmd_lower) and '播放' in cmd_lower:
+        # 如果命令同时包含截图/发送/后续操作等，跳过本地处理，交给 Claude
+        MIXED_OPS = ['然后', '接着', '截图', '发给', '发送', '发图片', '并且', '还有', '以及', '之后', '完了', '后再']
+        if any(kw in cmd for kw in MIXED_OPS):
+            return False, None
+
+        import re as _re
+        # 提取歌名: "播放XXX" 或 "播放 XXX"，截到句尾或 stop 前
+        m = _re.search(r'播放\s*(.+?)(?:\s*stop)?\s*$', cmd, _re.IGNORECASE)
         if m:
             song = m.group(1).strip()
             song = _re.sub(r'[歌曲音乐]', '', song).strip()
@@ -391,12 +654,15 @@ def reset_session():
             _prime_proc.kill()
         except:
             pass
+        untrack_claude_pid(_prime_proc.pid)
         _prime_proc = None
 
 
 def warmup_claude():
     """后台启动 Claude 预热会话，用户打字期间完成冷启动"""
     global _session_started, _prime_proc
+    if _prime_proc is not None and _prime_proc.poll() is None:
+        return  # 已有预热进程在运行
     try:
         args = [CLAUDE_CLI, '-p', '回复OK', '--permission-mode', 'bypassPermissions', '--effort', 'low']
         startupinfo = subprocess.STARTUPINFO()
@@ -404,23 +670,40 @@ def warmup_claude():
         startupinfo.wShowWindow = 6
         _prime_proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             cwd=WORK_DIR, creationflags=CREATE_NEW_CONSOLE,
             startupinfo=startupinfo,
         )
+        track_claude_pid(_prime_proc.pid)
     except:
         pass
 
 
 def call_claude(prompt):
-    """后台调用 Claude，自动保持会话连贯"""
+    """后台调用 Claude，自动保持会话连贯，自动检测 Claude 创建的新文件"""
     global _session_started, _prime_proc
 
-    # 检查后台预热是否已完成
+    # 检查后台预热：已完成则复用会话，未完成则杀掉（同一时间只允许一个 Claude 实例）
     if _prime_proc is not None:
-        if _prime_proc.poll() is not None:
+        if _prime_proc.poll() is None:
+            try:
+                _prime_proc.kill()
+            except:
+                pass
+            untrack_claude_pid(_prime_proc.pid)
+        else:
             _session_started = True  # 预热好了，用 --continue
-        _prime_proc = None  # 无论成败，只领一次
+            untrack_claude_pid(_prime_proc.pid)
+        _prime_proc = None
+
+    # 记录执行前的文件快照，Claude 执行后自动发送新增的图片/文件
+    existing_files = set()
+    try:
+        for f in os.listdir(WORK_DIR):
+            existing_files.add(f)
+    except:
+        pass
 
     try:
         if _session_started:
@@ -432,19 +715,41 @@ def call_claude(prompt):
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 6  # SW_MINIMIZE
-        result = subprocess.run(
+        proc = subprocess.Popen(
             args,
-            capture_output=True, text=True, timeout=300,
-            cwd=WORK_DIR, encoding='utf-8', errors='replace',
-            creationflags=CREATE_NEW_CONSOLE,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', errors='replace',
+            cwd=WORK_DIR, creationflags=CREATE_NEW_CONSOLE,
             startupinfo=startupinfo,
         )
-        output = result.stdout.strip()
-        if result.stderr:
-            stderr_short = result.stderr.strip()[:200]
+        track_claude_pid(proc.pid)
+        try:
+            stdout, stderr_text = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            untrack_claude_pid(proc.pid)
+            return "(Claude 执行超时，5分钟未完成)"
+        untrack_claude_pid(proc.pid)
+
+        output = stdout.strip()
+        if stderr_text:
+            stderr_short = stderr_text.strip()[:200]
             if stderr_short:
                 output += f"\n[stderr: {stderr_short}]"
-        return output[:MAX_RESPONSE_LENGTH] if output else f"(无输出, exit={result.returncode})"
+        if not output:
+            output = f"(无输出, exit={proc.returncode})"
+
+        # 检测 Claude 执行过程中创建的新文件（截图等），自动发送
+        try:
+            for f in os.listdir(WORK_DIR):
+                if f not in existing_files and os.path.isfile(os.path.join(WORK_DIR, f)):
+                    output += f"\n__FILE__:{os.path.join(WORK_DIR, f)}"
+        except:
+            pass
+
+        return output[:MAX_RESPONSE_LENGTH + 500]  # 允许略超限制以容纳文件路径
     except subprocess.TimeoutExpired:
         return "(Claude 执行超时，5分钟未完成)"
     except FileNotFoundError:
@@ -463,6 +768,8 @@ def run_bridge(chat_name="文件传输助手"):
     state = STATE_IDLE
     last_fingerprint = None      # cell 完整 Name（含时间戳），用于新消息检测
     last_processed_text = None   # 上次处理的消息正文，防止重复处理
+    cooldown_until = 0           # 冷却期：处理指令后短暂忽略所有消息，防止 Claude 动作的回声
+    recent_hashes = {}           # cmd_hash → expire_time，内容级去重，防止同一条指令被处理两次
 
     print("=" * 60)
     print("WeChat <-> Claude 桥接系统")
@@ -474,16 +781,49 @@ def run_bridge(chat_name="文件传输助手"):
     print("=" * 60)
     print()
 
-    def mark_processed(wechat, chat_name):
-        """更新基准，防止自己的回复被误判为新消息"""
-        nonlocal last_fingerprint, last_processed_text
-        time.sleep(0.5)  # 必须等微信 UI 刷新，否则会把自己的回复当新消息
+    def mark_processed(wechat, chat_name, sent_text=None, cmd_text=None):
+        """更新基准，防止自己的回复被误判为新消息。
+
+        sent_text: 刚发送的文本，直接记录不依赖微信 UI 回读。
+        cmd_text:  收到的指令原文，用于内容级去重。
+        """
+        nonlocal last_fingerprint, last_processed_text, cooldown_until, recent_hashes
+        if sent_text:
+            last_processed_text = sent_text
+        if cmd_text:
+            recent_hashes[hashlib.md5(cmd_text.encode()).hexdigest()] = time.time() + 30
+        time.sleep(2.0)
         fp = get_cell_fingerprint(wechat, chat_name)
-        text = get_last_message_text(wechat, chat_name)
         if fp:
             last_fingerprint = fp
-        if text:
-            last_processed_text = text
+        if not sent_text:
+            text = get_last_message_text(wechat, chat_name)
+            if text:
+                last_processed_text = text
+        cooldown_until = time.time() + 5
+
+    def _send_result_with_files(text):
+        """发送结果到微信，自动处理 __FILE__: 标记的文件，返回清洗后的纯文本"""
+        files_to_send = []
+        clean_lines = []
+        for line in text.split('\n'):
+            if line.startswith('__FILE__:'):
+                fpath = line[8:].strip()
+                if os.path.isfile(fpath):
+                    files_to_send.append(fpath)
+            else:
+                clean_lines.append(line)
+        clean_text = '\n'.join(clean_lines)
+
+        for fp in files_to_send:
+            print(f"  -> 发送文件: {fp}")
+            send_file_to_wechat(wechat, fp)
+            time.sleep(0.4)
+
+        text_to_send = clean_text.strip()
+        if text_to_send:
+            send_message(wechat, text_to_send)
+        return text_to_send
 
     # 初始化 last_fingerprint，跳过启动前的旧消息
     tmp_wechat = get_wechat()
@@ -512,12 +852,28 @@ def run_bridge(chat_name="文件传输助手"):
             current = get_last_message_text(wechat, chat_name)
             if not current:
                 continue
-            if current == last_processed_text:
-                continue
+            # 防止处理自己的回复（含微信截断情况）
+            if last_processed_text:
+                cmp_len = min(len(current), len(last_processed_text), 30)
+                if current[:cmp_len] == last_processed_text[:cmp_len]:
+                    continue
 
             # 防止把自己的系统消息当指令处理
             if current.startswith('(已') or current.startswith('酷狗:'):
                 continue
+
+            # 冷却期：忽略 Claude 脚本产生的回声消息
+            # 指纹已在循环顶部更新，冷却结束后不会重复检测同一条
+            if time.time() < cooldown_until:
+                continue
+
+            # 内容级去重：同一条消息 30 秒内不处理第二次
+            cmd_hash = hashlib.md5(current.encode()).hexdigest()
+            if cmd_hash in recent_hashes and time.time() < recent_hashes[cmd_hash]:
+                continue
+            # 清理过期哈希
+            now = time.time()
+            recent_hashes = {h: exp for h, exp in recent_hashes.items() if exp > now}
 
             print(f"[{time.strftime('%H:%M:%S')}] [{state}] 收到: {current}")
 
@@ -529,7 +885,7 @@ def run_bridge(chat_name="文件传输助手"):
 
                     open_chat(wechat, chat_name)
                     send_message(wechat, "(已进入指令模式，发送 claude/exit 退出)")
-                    mark_processed(wechat, chat_name)
+                    mark_processed(wechat, chat_name, "(已进入指令模式，发送 claude/exit 退出)", cmd_text=current)
                     warmup_claude()  # 后台预热 Claude，用户打字期间完成冷启动
 
             # --- ACTIVE 状态：每条消息 = 一条指令 ---
@@ -539,7 +895,7 @@ def run_bridge(chat_name="文件传输助手"):
                     print(f"  -> 退出指令模式，回到 IDLE")
                     open_chat(wechat, chat_name)
                     send_message(wechat, "(已退出)")
-                    mark_processed(wechat, chat_name)
+                    mark_processed(wechat, chat_name, "(已退出)", cmd_text=current)
                     state = STATE_IDLE
                     continue
 
@@ -548,7 +904,7 @@ def run_bridge(chat_name="文件传输助手"):
                     print(f"  -> 退出指令模式，回到 IDLE")
                     open_chat(wechat, chat_name)
                     send_message(wechat, "(已退出)")
-                    mark_processed(wechat, chat_name)
+                    mark_processed(wechat, chat_name, "(已退出)", cmd_text=current)
                     state = STATE_IDLE
                     continue
 
@@ -557,8 +913,48 @@ def run_bridge(chat_name="文件传输助手"):
                     reset_session()
                     open_chat(wechat, chat_name)
                     send_message(wechat, "(已重置)")
-                    mark_processed(wechat, chat_name)
+                    mark_processed(wechat, chat_name, "(已重置)", cmd_text=current)
                     print(f"  -> 会话已重置")
+                    continue
+
+                # 图片消息
+                if current == '[图片]':
+                    state = STATE_EXECUTE
+                    print(f"  -> 收到图片消息")
+                    open_chat(wechat, chat_name)
+                    img_paths = capture_images_from_chat(wechat)
+                    if img_paths:
+                        print(f"  -> 已截图 {len(img_paths)} 张: {img_paths}")
+                        result = call_claude(f"用户发来了 {len(img_paths)} 张图片，"
+                                            f"文件路径: {', '.join(img_paths)}。"
+                                            f"请查看这些图片并回复用户。")
+                    else:
+                        result = "(未能获取图片，请确认图片已加载后重试)"
+                    open_chat(wechat, chat_name)
+                    clean = _send_result_with_files(result)
+                    mark_processed(wechat, chat_name, clean or result, cmd_text=current)
+                    state = STATE_ACTIVE
+                    continue
+
+                # 文件消息
+                if current == '[文件]':
+                    state = STATE_EXECUTE
+                    print(f"  -> 收到文件消息")
+                    time.sleep(0.5)
+                    files = find_latest_files(3)
+                    if files:
+                        latest = files[0]
+                        fname = os.path.basename(latest)
+                        print(f"  -> 最新文件: {fname}")
+                        result = call_claude(f"用户发来了一个文件: {fname}，"
+                                            f"完整路径: {latest}。"
+                                            f"请查看该文件并回复用户。")
+                    else:
+                        result = "(未能找到文件，请确认文件已下载后重试)"
+                    open_chat(wechat, chat_name)
+                    clean = _send_result_with_files(result)
+                    mark_processed(wechat, chat_name, clean or result, cmd_text=current)
+                    state = STATE_ACTIVE
                     continue
 
                 # 执行指令
@@ -568,15 +964,21 @@ def run_bridge(chat_name="文件传输助手"):
 
                 handled, local_result = dispatch_local(current)
                 if handled:
-                    result = local_result
-                    print(f"  -> 本地指令: {result[:60]}")
+                    if isinstance(local_result, tuple) and local_result[0] == '__SEND_FILE__':
+                        fpath = local_result[1]
+                        open_chat(wechat, chat_name)
+                        ok = send_file_to_wechat(wechat, fpath)
+                        result = f"已发送: {os.path.basename(fpath)}" if ok else "发送失败"
+                        print(f"  -> 发送文件: {fpath}")
+                    else:
+                        result = local_result
+                        print(f"  -> 本地指令: {result[:60]}")
                 else:
                     result = call_claude(current)
 
                 open_chat(wechat, chat_name)
-                send_message(wechat, result)
-                mark_processed(wechat, chat_name)
-
+                clean = _send_result_with_files(result)
+                mark_processed(wechat, chat_name, clean or result, cmd_text=current)
                 print(f"  -> 已回复，继续等待指令")
                 state = STATE_ACTIVE
 

@@ -11,6 +11,8 @@ __pycache__/
 
 # Project runtime
 .bridge_lock
+.claude_pids
+*.log
 @AutomationLog.txt
 
 # Screenshots & temp images
