@@ -435,13 +435,14 @@ def run_bridge(chat_name="文件传输助手"):
 
     try:
         while True:
-            time.sleep(CHECK_INTERVAL)
+            try:
+                time.sleep(CHECK_INTERVAL)
 
-            # 连接微信
-            if not wechat or not wechat.Exists(0, 0.3):
-                wechat = get_wechat()
-                if not wechat:
-                    continue
+                # 连接微信
+                if not wechat or not wechat.Exists(0, 0.3):
+                    wechat = get_wechat()
+                    if not wechat:
+                        continue
 
             # 读取最新消息指纹（含时间戳，同一文本多次发送也能区分）
             fingerprint = get_cell_fingerprint(wechat, chat_name)
@@ -528,6 +529,10 @@ def run_bridge(chat_name="文件传输助手"):
             # --- EXECUTE 状态不应该持续到下一轮 ---
             elif state == STATE_EXECUTE:
                 state = STATE_IDLE
+
+            except Exception as loop_err:
+                print(f"[{time.strftime('%H:%M:%S')}] 循环异常(已恢复): {loop_err}")
+                time.sleep(1)
 
     except KeyboardInterrupt:
         print()
