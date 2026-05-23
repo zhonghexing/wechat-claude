@@ -379,17 +379,49 @@ def dispatch_local(cmd):
 
 # 会话状态：记录是否已有活跃会话，支持 --continue 保持上下文连贯
 _session_started = False
+_prime_proc = None  # 后台预热进程
 
 
 def reset_session():
     """重置会话，下次调用将开始新会话"""
-    global _session_started
+    global _session_started, _prime_proc
     _session_started = False
+    if _prime_proc:
+        try:
+            _prime_proc.kill()
+        except:
+            pass
+        _prime_proc = None
+
+
+def warmup_claude():
+    """后台启动 Claude 预热会话，用户打字期间完成冷启动"""
+    global _session_started, _prime_proc
+    try:
+        args = [CLAUDE_CLI, '-p', '回复OK', '--permission-mode', 'bypassPermissions', '--effort', 'low']
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 6
+        _prime_proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=WORK_DIR, creationflags=CREATE_NEW_CONSOLE,
+            startupinfo=startupinfo,
+        )
+    except:
+        pass
 
 
 def call_claude(prompt):
     """后台调用 Claude，自动保持会话连贯"""
-    global _session_started
+    global _session_started, _prime_proc
+
+    # 检查后台预热是否已完成
+    if _prime_proc is not None:
+        if _prime_proc.poll() is not None:
+            _session_started = True  # 预热好了，用 --continue
+        _prime_proc = None  # 无论成败，只领一次
+
     try:
         if _session_started:
             args = [CLAUDE_CLI, '--continue', '-p', prompt, '--permission-mode', 'bypassPermissions', '--effort', 'low']
@@ -397,7 +429,6 @@ def call_claude(prompt):
             args = [CLAUDE_CLI, '-p', prompt, '--permission-mode', 'bypassPermissions', '--effort', 'low']
             _session_started = True
 
-        # 最小化启动 Claude
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 6  # SW_MINIMIZE
@@ -485,9 +516,7 @@ def run_bridge(chat_name="文件传输助手"):
                 continue
 
             # 防止把自己的系统消息当指令处理
-            if current.startswith('(已') or current.startswith('(会话已重置'):
-                continue
-            if current.startswith('酷狗:'):
+            if current.startswith('(已') or current.startswith('酷狗:'):
                 continue
 
             print(f"[{time.strftime('%H:%M:%S')}] [{state}] 收到: {current}")
@@ -495,23 +524,21 @@ def run_bridge(chat_name="文件传输助手"):
             # --- IDLE 状态：等待 claude 进入指令模式 ---
             if state == STATE_IDLE:
                 if is_claude_start(current) and not extract_command(current):
-                    # 单独一条 "claude" → 进入指令模式
                     state = STATE_ACTIVE
                     print(f"  -> 进入指令模式")
 
-                    ensure_wechat_ready(wechat)
                     open_chat(wechat, chat_name)
-                    send_message(wechat, "(已进入指令模式，每条消息将作为指令执行。发送 claude 或 exit 退出)")
+                    send_message(wechat, "(已进入指令模式，发送 claude/exit 退出)")
                     mark_processed(wechat, chat_name)
+                    warmup_claude()  # 后台预热 Claude，用户打字期间完成冷启动
 
             # --- ACTIVE 状态：每条消息 = 一条指令 ---
             elif state == STATE_ACTIVE:
                 # 退出指令模式
                 if is_claude_start(current) and not extract_command(current):
                     print(f"  -> 退出指令模式，回到 IDLE")
-                    ensure_wechat_ready(wechat)
                     open_chat(wechat, chat_name)
-                    send_message(wechat, "(已退出指令模式)")
+                    send_message(wechat, "(已退出)")
                     mark_processed(wechat, chat_name)
                     state = STATE_IDLE
                     continue
@@ -519,9 +546,8 @@ def run_bridge(chat_name="文件传输助手"):
                 cmd_lower = current.lower().strip()
                 if cmd_lower in ('exit', '退出', 'quit'):
                     print(f"  -> 退出指令模式，回到 IDLE")
-                    ensure_wechat_ready(wechat)
                     open_chat(wechat, chat_name)
-                    send_message(wechat, "(已退出指令模式)")
+                    send_message(wechat, "(已退出)")
                     mark_processed(wechat, chat_name)
                     state = STATE_IDLE
                     continue
@@ -529,9 +555,8 @@ def run_bridge(chat_name="文件传输助手"):
                 # 检查是否是重置指令
                 if current.strip() in ('重置', '重置会话', '新会话', 'reset', 'new'):
                     reset_session()
-                    ensure_wechat_ready(wechat)
                     open_chat(wechat, chat_name)
-                    send_message(wechat, "(会话已重置，下次指令将开始新对话)")
+                    send_message(wechat, "(已重置)")
                     mark_processed(wechat, chat_name)
                     print(f"  -> 会话已重置")
                     continue
@@ -548,9 +573,7 @@ def run_bridge(chat_name="文件传输助手"):
                 else:
                     result = call_claude(current)
 
-                ensure_wechat_ready(wechat)
                 open_chat(wechat, chat_name)
-                time.sleep(0.05)
                 send_message(wechat, result)
                 mark_processed(wechat, chat_name)
 
