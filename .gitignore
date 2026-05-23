@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project runtime
+.bridge_lock
+@AutomationLog.txt
+
+# Screenshots & temp images
+*.png
+*.jpg
+*.jpeg
+!screenshots/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# User config (paths differ per machine)
+.claude/
+kugou_positions.json
