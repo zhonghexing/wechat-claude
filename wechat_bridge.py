@@ -420,7 +420,7 @@ def run_bridge(chat_name="文件传输助手"):
     def mark_processed(wechat, chat_name):
         """更新基准，防止自己的回复被误判为新消息"""
         nonlocal last_fingerprint, last_processed_text
-        time.sleep(0.15)
+        time.sleep(0.5)  # 必须等微信 UI 刷新，否则会把自己的回复当新消息
         fp = get_cell_fingerprint(wechat, chat_name)
         text = get_last_message_text(wechat, chat_name)
         if fp:
@@ -456,6 +456,12 @@ def run_bridge(chat_name="文件传输助手"):
             if not current:
                 continue
             if current == last_processed_text:
+                continue
+
+            # 防止把自己的系统消息当指令处理
+            if current.startswith('(已') or current.startswith('(会话已重置'):
+                continue
+            if current.startswith('酷狗:'):
                 continue
 
             print(f"[{time.strftime('%H:%M:%S')}] [{state}] 收到: {current}")
@@ -532,29 +538,21 @@ def run_bridge(chat_name="文件传输助手"):
     except KeyboardInterrupt:
         print()
         print("桥接系统已停止")
-        raise
+        return
     except Exception as e:
         print(f"运行出错(3秒后自动重启): {e}")
         import traceback
         traceback.print_exc()
-        release_lock()
-        time.sleep(3)
-        # 递归重启
-        try:
-            run_bridge(chat_name)
-        except KeyboardInterrupt:
-            pass
-        return
     finally:
         release_lock()
 
 
 def main():
     chat_name = sys.argv[1] if len(sys.argv) > 1 else "文件传输助手"
-    try:
+    while True:
         run_bridge(chat_name)
-    finally:
-        release_lock()
+        print("桥接已退出，3秒后自动重启...")
+        time.sleep(3)
 
 
 if __name__ == '__main__':
