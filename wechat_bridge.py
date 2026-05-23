@@ -169,6 +169,18 @@ def get_last_message_text(wechat, chat_name):
     return None
 
 
+def get_cell_fingerprint(wechat, chat_name):
+    """获取会话 cell 的完整指纹（含时间戳），用于可靠的新消息检测。
+
+    不能只用消息正文对比，因为用户可能连续发送相同内容（如多次 "claude"），
+    正文相同但时间戳不同，用完整 Name 才能区分。
+    """
+    info = get_chat_cell_info(wechat, chat_name)
+    if info:
+        return info['name']
+    return None
+
+
 def get_chat_cell_info(wechat, chat_name):
     session_list = wechat.Control(AutomationId='session_list')
     if not session_list.Exists(0, 0.3):
@@ -394,8 +406,8 @@ def run_bridge(chat_name="文件传输助手"):
 
     wechat = None
     state = STATE_IDLE
-    last_seen = None
-    last_processed = None
+    last_fingerprint = None      # cell 完整 Name（含时间戳），用于新消息检测
+    last_processed_text = None   # 上次处理的消息正文，防止重复处理
 
     print("=" * 60)
     print("WeChat <-> Claude 桥接系统")
@@ -409,17 +421,19 @@ def run_bridge(chat_name="文件传输助手"):
 
     def mark_processed(wechat, chat_name):
         """更新基准，防止自己的回复被误判为新消息"""
-        nonlocal last_seen, last_processed
+        nonlocal last_fingerprint, last_processed_text
         time.sleep(0.3)
-        current = get_last_message_text(wechat, chat_name)
-        if current:
-            last_seen = current
-            last_processed = current
+        fp = get_cell_fingerprint(wechat, chat_name)
+        text = get_last_message_text(wechat, chat_name)
+        if fp:
+            last_fingerprint = fp
+        if text:
+            last_processed_text = text
 
-    # 初始化 last_seen，跳过启动前的旧消息
+    # 初始化 last_fingerprint，跳过启动前的旧消息
     tmp_wechat = get_wechat()
     if tmp_wechat:
-        last_seen = get_last_message_text(tmp_wechat, chat_name)
+        last_fingerprint = get_cell_fingerprint(tmp_wechat, chat_name)
 
     try:
         while True:
@@ -431,14 +445,19 @@ def run_bridge(chat_name="文件传输助手"):
                 if not wechat:
                     continue
 
-            # 读取最新消息
+            # 读取最新消息指纹（含时间戳，同一文本多次发送也能区分）
+            fingerprint = get_cell_fingerprint(wechat, chat_name)
+            if not fingerprint:
+                continue
+            if fingerprint == last_fingerprint:
+                continue
+            last_fingerprint = fingerprint
+
+            # 提取消息正文
             current = get_last_message_text(wechat, chat_name)
             if not current:
                 continue
-            if current == last_seen:
-                continue
-            last_seen = current
-            if current == last_processed:
+            if current == last_processed_text:
                 continue
 
             print(f"[{time.strftime('%H:%M:%S')}] [{state}] 收到: {current}")
@@ -451,6 +470,7 @@ def run_bridge(chat_name="文件传输助手"):
                     print(f"  -> 进入指令模式")
 
                     ensure_wechat_ready(wechat)
+                    open_chat(wechat, chat_name)
                     send_message(wechat, "(已进入指令模式，每条消息将作为指令执行。发送 claude 或 exit 退出)")
                     mark_processed(wechat, chat_name)
 
@@ -460,6 +480,7 @@ def run_bridge(chat_name="文件传输助手"):
                 if is_claude_start(current) and not extract_command(current):
                     print(f"  -> 退出指令模式，回到 IDLE")
                     ensure_wechat_ready(wechat)
+                    open_chat(wechat, chat_name)
                     send_message(wechat, "(已退出指令模式)")
                     mark_processed(wechat, chat_name)
                     state = STATE_IDLE
@@ -469,6 +490,7 @@ def run_bridge(chat_name="文件传输助手"):
                 if cmd_lower in ('exit', '退出', 'quit'):
                     print(f"  -> 退出指令模式，回到 IDLE")
                     ensure_wechat_ready(wechat)
+                    open_chat(wechat, chat_name)
                     send_message(wechat, "(已退出指令模式)")
                     mark_processed(wechat, chat_name)
                     state = STATE_IDLE
@@ -478,6 +500,7 @@ def run_bridge(chat_name="文件传输助手"):
                 if current.strip() in ('重置', '重置会话', '新会话', 'reset', 'new'):
                     reset_session()
                     ensure_wechat_ready(wechat)
+                    open_chat(wechat, chat_name)
                     send_message(wechat, "(会话已重置，下次指令将开始新对话)")
                     mark_processed(wechat, chat_name)
                     print(f"  -> 会话已重置")
@@ -489,6 +512,7 @@ def run_bridge(chat_name="文件传输助手"):
                 print(f"  -> {session_tag} 指令: {current}")
 
                 ensure_wechat_ready(wechat)
+                open_chat(wechat, chat_name)
                 send_message(wechat, f"(执行中...) {current[:50]}")
                 mark_processed(wechat, chat_name)
 
