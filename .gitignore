@@ -24,6 +24,23 @@ __pycache__/
 *.jpeg
 !screenshots/
 
+# Screen recordings
+_record_*.mp4
+
+# Temp diagnostic scripts
+_debug_*.py
+_diagnose_*.py
+_dl_*.ps1
+_find_*.ps1
+_gen_*.py
+_verify_*.py
+
+# FFmpeg downloads
+ffmpeg*.zip
+
+# ClawBot temp PS1
+_screenshot.ps1
+
 # OS
 Thumbs.db
 Desktop.ini

@@ -33,7 +33,7 @@ import logging
 import logging.handlers
 import argparse
 import threading
-import queue
+import tempfile
 from pathlib import Path
 
 # ---------- 第三方依赖检查 ----------
@@ -354,6 +354,284 @@ def send_typing(token, ilink_user_id, typing_ticket, status=1):
     return api_post("ilink/bot/sendtyping", body, token=token, timeout=10)
 
 
+# ---------- CDN 媒体上传 (AES-128-ECB 加密) ----------
+
+def _aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+    """AES-128-ECB 加密（无填充，数据长度必须是 16 的倍数）"""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
+    encryptor = cipher.encryptor()
+    return encryptor.update(data) + encryptor.finalize()
+
+
+def _aes_ecb_decrypt(data: bytes, key: bytes) -> bytes:
+    """AES-128-ECB 解密"""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    cipher = Cipher(algorithms.AES(key), modes.ECB())
+    decryptor = cipher.decryptor()
+    return decryptor.update(data) + decryptor.finalize()
+
+
+def _pad_pkcs7(data: bytes, block_size: int = 16) -> bytes:
+    pad_len = block_size - (len(data) % block_size)
+    return data + bytes([pad_len] * pad_len)
+
+
+def _unpad_pkcs7(data: bytes) -> bytes:
+    """移除 PKCS7 填充（返回去除尾部填充的原始数据）"""
+    if not data:
+        return data
+    pad_len = data[-1]
+    if pad_len < 1 or pad_len > 16:
+        return data  # 非 PKCS7，原样返回
+    return data[:-pad_len]
+
+
+def _download_cdn_media(media: dict, base_url: str) -> bytes | None:
+    """从 CDN 下载加密媒体 → AES-128-ECB 解密 → 返回原始 bytes"""
+    filekey = media.get("filekey", "")
+    param = media.get("encrypt_query_param", "")
+    aeskey_str = media.get("aeskey", "")
+    if not filekey or not param or not aeskey_str:
+        return None
+
+    # aeskey 兼容 hex（32 字符）和 base64（24 字符）两种编码
+    aes_key = None
+    if len(aeskey_str) == 32:
+        try:
+            aes_key = bytes.fromhex(aeskey_str)
+        except ValueError:
+            pass
+    if aes_key is None:
+        try:
+            aes_key = base64.b64decode(aeskey_str)
+        except Exception:
+            pass
+    if aes_key is None or len(aes_key) != 16:
+        log.error(f"_download_cdn_media: 无法解析 aeskey (len={len(aeskey_str)})")
+        return None
+
+    # 构造下载 URL
+    cdn_base = base_url.replace("ilinkai.weixin.qq.com", "cdn.ilinkai.weixin.qq.com")
+    dl_url = f"{cdn_base}/download?encrypted_query_param={param}&filekey={filekey}"
+
+    try:
+        resp = requests.get(dl_url, timeout=30)
+        if resp.status_code != 200:
+            log.error(f"CDN download failed: {resp.status_code}")
+            return None
+        encrypted = resp.content
+    except Exception as e:
+        log.error(f"CDN download exception: {e}")
+        return None
+
+    # AES-128-ECB 解密 + 去填充
+    try:
+        decrypted = _aes_ecb_decrypt(encrypted, aes_key)
+        raw = _unpad_pkcs7(decrypted)
+        log.info(f"CDN download OK: filekey={filekey}, size={len(raw)}")
+        return raw
+    except Exception as e:
+        log.error(f"AES decrypt failed: {e}")
+        return None
+
+
+def _download_and_save_image(media: dict, work_dir: str, base_url: str) -> str | None:
+    """下载 CDN 图片并保存到本地，返回文件路径"""
+    raw = _download_cdn_media(media, base_url)
+    if raw is None:
+        return None
+
+    ts = int(time.time())
+    rand = os.urandom(4).hex()
+    filename = f"_wechat_img_{ts}_{rand}.png"
+    filepath = os.path.join(work_dir, filename)
+    try:
+        with open(filepath, 'wb') as f:
+            f.write(raw)
+        log.info(f"图片已保存: {filepath}")
+        return filepath
+    except Exception as e:
+        log.error(f"保存图片失败: {e}")
+        return None
+
+
+def _upload_file_to_cdn(filepath: str, token: str, to_user_id: str,
+                         media_type: int, base_url: str) -> dict | None:
+    """
+    CDN 上传流程：AES-128-ECB 加密 → getUploadUrl → HTTP POST → 返回 CDN 引用。
+    media_type: 1=IMAGE, 2=VIDEO, 4=VOICE, 3=FILE
+    返回: {filekey, aeskey(hex), file_size, file_size_ciphertext, download_param}
+    """
+    import hashlib as _hashlib
+
+    with open(filepath, 'rb') as f:
+        raw_data = f.read()
+
+    raw_size = len(raw_data)
+    raw_md5_hex = _hashlib.md5(raw_data).digest().hex()  # hex 格式！
+
+    # AES-128-ECB 加密（PKCS7 填充，Node.js createCipheriv 行为）
+    aes_key = os.urandom(16)
+    padded = _pad_pkcs7(raw_data, 16)
+    encrypted = _aes_ecb_encrypt(padded, aes_key)
+    enc_size = len(encrypted)
+
+    # getUploadUrl — aeskey 用 hex，rawfilemd5 用 hex
+    filekey = os.urandom(16).hex()
+    aeskey_hex = aes_key.hex()
+
+    req = {
+        "filekey": filekey,
+        "media_type": media_type,
+        "to_user_id": to_user_id,
+        "rawsize": raw_size,
+        "rawfilemd5": raw_md5_hex,
+        "filesize": enc_size,
+        "aeskey": aeskey_hex,
+        "no_need_thumb": True,
+    }
+    resp = api_post("ilink/bot/getuploadurl", req, token=token, timeout=15)
+    upload_url = resp.get("upload_full_url", "")
+    upload_param = resp.get("upload_param", "")
+
+    if not upload_url and not upload_param:
+        log.error(f"getUploadUrl failed (no URL): {resp}")
+        return None
+    if not upload_url:
+        # fallback: 拼接 CDN URL
+        cdn_base = base_url.replace("ilinkai.weixin.qq.com", "cdn.ilinkai.weixin.qq.com")
+        upload_url = f"{cdn_base}/upload?encrypted_query_param={upload_param}&filekey={filekey}"
+        log.debug(f"CDN upload URL fallback via upload_param")
+
+    # HTTP POST 上传加密文件（Content-Type: application/octet-stream）
+    try:
+        put_resp = requests.post(upload_url, data=encrypted,
+                                 headers={"Content-Type": "application/octet-stream"},
+                                 timeout=30)
+        if put_resp.status_code not in (200, 201, 204):
+            log.error(f"CDN POST failed: {put_resp.status_code} {put_resp.text[:200]}")
+            return None
+        # 下载参数从响应头 x-encrypted-param 获取
+        download_param = put_resp.headers.get("x-encrypted-param", "")
+        if not download_param:
+            log.error("CDN response missing x-encrypted-param header")
+            return None
+    except Exception as e:
+        log.error(f"CDN POST exception: {e}")
+        return None
+
+    log.info(f"CDN upload OK: {filepath} ({raw_size} bytes) -> {filekey}")
+    return {
+        "filekey": filekey,
+        "aeskey": aeskey_hex,
+        "file_size": raw_size,
+        "file_size_ciphertext": enc_size,
+        "download_param": download_param,
+    }
+
+
+def send_image_message(token, to_user_id, filepath, context_token=None):
+    """上传图片到 CDN 并通过微信发送"""
+    result = _upload_file_to_cdn(filepath, token, to_user_id, 1, ILINK_BASE_URL)
+    if not result:
+        log.error(f"send_image_message: CDN upload failed for {filepath}")
+        return False
+
+    body = {
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to_user_id,
+            "client_id": f"clawbot-{os.urandom(8).hex()}",
+            "message_type": 2,
+            "message_state": 2,
+            "context_token": context_token or "",
+            "item_list": [{
+                "type": 2,
+                "image_item": {
+                    "media": {
+                        "encrypt_query_param": result["download_param"],
+                        "aes_key": base64.b64encode(result["aeskey"].encode()).decode(),
+                        "encrypt_type": 1,
+                    },
+                    "mid_size": result["file_size_ciphertext"],
+                }
+            }],
+        },
+        "base_info": {"channel_version": "2.4.4", "bot_agent": DEFAULT_BOT_AGENT},
+    }
+    resp = api_post("ilink/bot/sendmessage", body, token=token)
+    log.info(f"send_image_message: {filepath} -> WeChat, resp={resp}")
+    return True
+
+
+def send_file_message(token, to_user_id, filepath, context_token=None):
+    """上传文件到 CDN 并通过微信发送（自动判断视频用 video_item）"""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm'):
+        return _send_video_message(token, to_user_id, filepath, context_token)
+    fname = os.path.basename(filepath)
+    result = _upload_file_to_cdn(filepath, token, to_user_id, 3, ILINK_BASE_URL)
+    if not result:
+        log.error(f"send_file_message: CDN upload failed for {filepath}")
+        return False
+    body = {
+        "msg": {
+            "from_user_id": "", "to_user_id": to_user_id,
+            "client_id": f"clawbot-{os.urandom(8).hex()}",
+            "message_type": 2, "message_state": 2,
+            "context_token": context_token or "",
+            "item_list": [{
+                "type": 4,
+                "file_item": {
+                    "media": {
+                        "encrypt_query_param": result["download_param"],
+                        "aes_key": base64.b64encode(result["aeskey"].encode()).decode(),
+                        "encrypt_type": 1,
+                    },
+                    "file_name": fname,
+                    "len": str(result["file_size"]),
+                }
+            }],
+        },
+        "base_info": {"channel_version": "2.4.4", "bot_agent": DEFAULT_BOT_AGENT},
+    }
+    resp = api_post("ilink/bot/sendmessage", body, token=token)
+    log.info(f"send_file_message: {filepath} -> WeChat, resp={resp}")
+    return True
+
+
+def _send_video_message(token, to_user_id, filepath, context_token=None):
+    """发送视频 — 用 video_item (type=5)，微信原生播放器"""
+    result = _upload_file_to_cdn(filepath, token, to_user_id, 2, ILINK_BASE_URL)  # VIDEO=2
+    if not result:
+        log.error(f"_send_video_message: CDN upload failed for {filepath}")
+        return False
+    body = {
+        "msg": {
+            "from_user_id": "", "to_user_id": to_user_id,
+            "client_id": f"clawbot-{os.urandom(8).hex()}",
+            "message_type": 2, "message_state": 2,
+            "context_token": context_token or "",
+            "item_list": [{
+                "type": 5,
+                "video_item": {
+                    "media": {
+                        "encrypt_query_param": result["download_param"],
+                        "aes_key": base64.b64encode(result["aeskey"].encode()).decode(),
+                        "encrypt_type": 1,
+                    },
+                    "video_size": result["file_size_ciphertext"],
+                }
+            }],
+        },
+        "base_info": {"channel_version": "2.4.4", "bot_agent": DEFAULT_BOT_AGENT},
+    }
+    resp = api_post("ilink/bot/sendmessage", body, token=token)
+    log.info(f"_send_video_message: {filepath} -> WeChat, resp={resp}")
+    return True
+
+
 def get_config(token, ilink_user_id, context_token=None):
     body = {
         "ilink_user_id": ilink_user_id,
@@ -374,8 +652,8 @@ def notify_stop(token):
 
 
 # ---------- 消息解析 ----------
-def extract_text(item_list):
-    """从 item_list 中提取纯文本"""
+def extract_text(item_list, work_dir=".", base_url=ILINK_BASE_URL):
+    """从 item_list 中提取纯文本，图片自动下载到本地"""
     if not item_list:
         return ""
     for item in item_list:
@@ -386,6 +664,10 @@ def extract_text(item_list):
             if text:
                 return f"[语音] {text}"
         if item.get("type") == 2:  # IMAGE
+            media = item.get("image_item", {}).get("media", {})
+            fp = _download_and_save_image(media, work_dir, base_url)
+            if fp:
+                return f"[图片] __FILE__:{fp}"
             return "[图片]"
         if item.get("type") == 5:  # VIDEO
             return "[视频]"
@@ -414,9 +696,200 @@ def extract_command(text):
 
 
 # ---------- 本地指令调度 ----------
+def do_screenshot(work_dir):
+    """用 PowerShell GDI CopyFromScreen 截图（MemoryStream 中转避免中文路径 GDI+ bug）"""
+    ts = int(time.time())
+    rand = os.urandom(4).hex()
+    path = os.path.join(work_dir, f"_screenshot_{ts}_{rand}.png")
+    # 清理旧截图（只清理非当前文件）
+    for f in os.listdir(work_dir):
+        if f.startswith("_screenshot") and f.endswith(".png") and f != os.path.basename(path):
+            try:
+                os.remove(os.path.join(work_dir, f))
+            except:
+                pass
+
+    ps_name = f"_clawbot_scr_{rand}.ps1"
+    ps_path = os.path.join(tempfile.gettempdir(), ps_name)
+    with open(ps_path, 'w', encoding='utf-8-sig') as f:
+        f.write(f'''Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+Start-Sleep -Milliseconds 200
+$s = [System.Windows.Forms.Screen]::PrimaryScreen
+$b = New-Object System.Drawing.Bitmap($s.Bounds.Width, $s.Bounds.Height)
+$g = [System.Drawing.Graphics]::FromImage($b)
+$g.CopyFromScreen($s.Bounds.X, $s.Bounds.Y, 0, 0, $s.Bounds.Size)
+$g.Dispose()
+$ms = New-Object System.IO.MemoryStream
+$b.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$b.Dispose()
+[System.IO.File]::WriteAllBytes("{path}", $ms.ToArray())
+$ms.Dispose()
+''')
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 6
+    r = subprocess.run(
+        ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps_path],
+        capture_output=True, text=True, timeout=15,
+        cwd=work_dir, encoding='utf-8', errors='replace',
+        creationflags=0x00000010,
+        startupinfo=startupinfo,
+    )
+    try:
+        os.remove(ps_path)
+    except:
+        pass
+
+    if r.returncode == 0 and os.path.isfile(path):
+        return path
+    log.error(f"截图失败: {r.stderr[:200]}")
+    return None
+
+
+def _send_via_uia(filepath, chat_name='文件传输助手'):
+    """通过桌面微信 UIAutomation + CF_HDROP 剪贴板发送文件"""
+    try:
+        import uiautomation as auto
+        import ctypes
+    except ImportError:
+        log.warn("uiautomation 未安装，无法通过桌面微信发送")
+        return False
+
+    CF_HDROP = 15
+    GMEM_MOVEABLE = 0x0002
+
+    class DROPFILES(ctypes.Structure):
+        _fields_ = [("pFiles", ctypes.c_uint),
+                     ("pt", ctypes.c_long * 2),
+                     ("fNC", ctypes.c_int),
+                     ("fWide", ctypes.c_int)]
+
+    abs_path = os.path.abspath(filepath)
+    filedata = (abs_path + '\0\0').encode('utf-16-le')
+    df_size = ctypes.sizeof(DROPFILES)
+    total = df_size + len(filedata)
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
+    user32.OpenClipboard(0)
+    user32.EmptyClipboard()
+    hMem = kernel32.GlobalAlloc(GMEM_MOVEABLE, total)
+    ptr = kernel32.GlobalLock(hMem)
+    df = DROPFILES()
+    df.pFiles = df_size
+    df.fWide = 1
+    ctypes.memmove(ptr, ctypes.addressof(df), df_size)
+    ctypes.memmove(ptr + df_size, filedata, len(filedata))
+    kernel32.GlobalUnlock(ctypes.c_void_p(hMem))
+    user32.SetClipboardData(CF_HDROP, ctypes.c_void_p(hMem))
+    user32.CloseClipboard()
+
+    # 找到微信窗口并打开聊天
+    wechat = None
+    for name in ['微信', 'Weixin', 'WeChat']:
+        w = auto.WindowControl(Name=name, ClassName='mmui::MainWindow', searchDepth=1)
+        if w.Exists(0, 0.5):
+            wechat = w
+            break
+    if not wechat:
+        return False
+
+    # 确保窗口可见
+    if ctypes.windll.user32.IsIconic(wechat.NativeWindowHandle):
+        ctypes.windll.user32.ShowWindow(wechat.NativeWindowHandle, 9)
+    wechat.SetActive()
+    time.sleep(0.2)
+
+    # 关闭已打开的独立聊天窗口
+    standalone = auto.WindowControl(Name=chat_name)
+    if standalone.Exists(0, 0.3):
+        try:
+            close_btn = standalone.Control(Name='关闭')
+            if close_btn.Exists(0, 0.3):
+                close_btn.Click()
+                time.sleep(0.1)
+        except:
+            pass
+
+    # 检查是否已打开
+    def _chat_open():
+        inp = wechat.Control(AutomationId='chat_input_field')
+        return inp.Exists(0, 0.3) and chat_name in (inp.Name or '')
+
+    if not _chat_open():
+        # 点击微信标签页
+        chat_tab = wechat.Control(Name='微信', ClassName='mmui::XTabBarItem')
+        if chat_tab.Exists(0, 0.2):
+            chat_tab.Click()
+            time.sleep(0.1)
+
+        if not _chat_open():
+            cell = wechat.Control(AutomationId=f"session_item_{chat_name}")
+            if cell.Exists(0, 1):
+                cell.Click()
+                time.sleep(0.5)
+                # 点出独立窗口？关掉重来
+                if not _chat_open():
+                    s2 = auto.WindowControl(Name=chat_name)
+                    if s2.Exists(0, 0.3):
+                        try:
+                            s2.Control(Name='关闭').Click()
+                        except:
+                            pass
+                        time.sleep(0.3)
+                        wechat.SetActive()
+                        c2 = wechat.Control(AutomationId=f"session_item_{chat_name}")
+                        if c2.Exists(0, 1):
+                            c2.Click()
+                            time.sleep(0.8)
+            else:
+                log.warn(f"UIA 未找到联系人: {chat_name}")
+                return False
+
+    # Ctrl+V + Enter 发送
+    auto.SendKeys('{Ctrl}v')
+    time.sleep(0.2)
+    auto.SendKeys('{Enter}')
+    return True
+
+
 def dispatch_local(cmd, work_dir):
     """本地快捷操作（秒级响应，不走 Claude），返回 (handled, result)"""
     cmd_lower = cmd.lower().strip()
+
+    # 截图 — 本地处理，秒级响应。只有"分析/识别图片内容"才走 Claude
+    SCREENSHOT_KW = ['截图', '截屏', '截个图', '屏幕截图', 'screenshot']
+    is_screenshot = any(kw in cmd_lower for kw in SCREENSHOT_KW)
+    needs_analysis = any(kw in cmd for kw in ['分析', '识别', '图片里', '图片中', '图里', '上面写了', '看看'])
+    if is_screenshot and not needs_analysis:
+        # 前置操作：最小化窗口
+        if '最小化' in cmd or '隐藏' in cmd:
+            import ctypes
+            ctypes.windll.user32.keybd_event(0x5B, 0, 0, 0)  # Win
+            ctypes.windll.user32.keybd_event(0x4D, 0, 0, 0)  # M
+            ctypes.windll.user32.keybd_event(0x4D, 0, 2, 0)  # M up
+            ctypes.windll.user32.keybd_event(0x5B, 0, 2, 0)  # Win up
+            time.sleep(0.5)
+        path = do_screenshot(work_dir)
+        if not path:
+            return True, "截图失败，请重试"
+        sz = os.path.getsize(path)
+        # 如果用户提到"文件传输助手"，走桌面微信 UIA 粘贴发送
+        if '文件传输助手' in cmd:
+            ok = _send_via_uia(path, chat_name='文件传输助手')
+            if ok:
+                return True, f"已截图并通过文件传输助手发送 ({sz//1024}KB)"
+            else:
+                return True, f"截图完成但UIA发送失败，通过ClawBot发送:\n__FILE__:{path}"
+        return True, f"截图完成 ({sz//1024}KB)\n__FILE__:{path}"
 
     # 酷狗音乐播放
     if ('酷狗' in cmd_lower or 'kugou' in cmd_lower) and '播放' in cmd_lower:
@@ -496,35 +969,70 @@ def reset_session():
         _prime_proc = None
 
 
+def warmup_claude(config):
+    """后台预热 Claude 进程，下次消息秒级响应"""
+    global _session_started, _prime_proc
+    if _prime_proc is not None and _prime_proc.poll() is None:
+        return  # 已有预热在跑
+    try:
+        cli = config.get('CTI_CLAUDE_CLI', '')
+        work_dir = config.get('CTI_WORK_DIR', '')
+        model = config.get('CTI_CLAUDE_MODEL', '')
+        effort = config.get('CTI_CLAUDE_EFFORT', 'low')
+        perm = config.get('CTI_CLAUDE_PERMISSION_MODE', 'bypassPermissions')
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 6
+        args = [cli, '-p', '回复OK', '--permission-mode', perm, '--effort', effort]
+        if model:
+            args += ['--model', model]
+        _prime_proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=work_dir, creationflags=0x08000000, startupinfo=startupinfo,
+        )
+        track_claude_pid(_prime_proc.pid)
+        log.debug("后台预热 Claude 进程...")
+    except Exception as e:
+        log.debug(f"预热失败: {e}")
+
+
 def call_claude(prompt, config):
     """调用 Claude Code CLI，自动保持会话连贯"""
     global _session_started, _prime_proc
 
     cli = config.get('CTI_CLAUDE_CLI', '')
     work_dir = config.get('CTI_WORK_DIR', os.path.dirname(os.path.abspath(__file__)))
+    model = config.get('CTI_CLAUDE_MODEL', '')
     effort = config.get('CTI_CLAUDE_EFFORT', 'low')
     perm = config.get('CTI_CLAUDE_PERMISSION_MODE', 'bypassPermissions')
     timeout_s = int(config.get('CTI_CLAUDE_TIMEOUT', '300'))
     max_len = int(config.get('CTI_MAX_RESPONSE_LENGTH', '500'))
 
-    # 处理预热进程
+    # 处理预热进程：已完成则复用，未完成则等待（不杀！）
+    had_warmup = False
     if _prime_proc is not None:
         if _prime_proc.poll() is None:
+            # 预热还在跑，等最多 15 秒
             try:
+                _prime_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
                 _prime_proc.kill()
-            except:
-                pass
-            untrack_claude_pid(_prime_proc.pid)
-        else:
+                untrack_claude_pid(_prime_proc.pid)
+                _prime_proc = None
+        if _prime_proc is not None:
             _session_started = True
+            had_warmup = True
             untrack_claude_pid(_prime_proc.pid)
-        _prime_proc = None
+            _prime_proc = None
 
     # 文件快照
-    existing_files = set()
+    existing_files = {}
     try:
         for f in os.listdir(work_dir):
-            existing_files.add(f)
+            fp = os.path.join(work_dir, f)
+            if os.path.isfile(fp):
+                existing_files[f] = os.path.getmtime(fp)
     except:
         pass
 
@@ -534,10 +1042,12 @@ def call_claude(prompt, config):
         else:
             args = [cli, '-p', prompt, '--permission-mode', perm, '--effort', effort]
             _session_started = True
+        if model:
+            args += ['--model', model]
 
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 6  # SW_MINIMIZE
+        startupinfo.wShowWindow = 6
 
         proc = subprocess.Popen(
             args,
@@ -545,7 +1055,7 @@ def call_claude(prompt, config):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding='utf-8', errors='replace',
             cwd=work_dir,
-            creationflags=0x00000010,  # CREATE_NEW_CONSOLE
+            creationflags=0x08000000,  # CREATE_NO_WINDOW — 更快
             startupinfo=startupinfo,
         )
         track_claude_pid(proc.pid)
@@ -568,11 +1078,25 @@ def call_claude(prompt, config):
         if not output:
             output = f"(无输出, exit={proc.returncode})"
 
-        # 检测新文件
+        # 检测新文件和被修改的媒体文件（用 mtime 比对），不发送脚本/工作文件
+        MEDIA_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.ico',
+                      '.mp4', '.mp3', '.wav', '.avi', '.mov', '.pdf',
+                      '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.zip', '.rar'}
         try:
             for f in os.listdir(work_dir):
-                if f not in existing_files and os.path.isfile(os.path.join(work_dir, f)):
-                    output += f"\n__FILE__:{os.path.join(work_dir, f)}"
+                fp = os.path.join(work_dir, f)
+                if not os.path.isfile(fp):
+                    continue
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in MEDIA_EXTS:
+                    continue
+                prev_mtime = existing_files.get(f)
+                if prev_mtime is None:
+                    log.info(f"新文件: {f}")
+                    output += f"\n__FILE__:{fp}"
+                elif os.path.getmtime(fp) > prev_mtime + 1:
+                    log.info(f"文件已更新: {f}")
+                    output += f"\n__FILE__:{fp}"
         except:
             pass
 
@@ -584,36 +1108,60 @@ def call_claude(prompt, config):
 
 
 # ---------- Claude 系统提示词 ----------
-SYSTEM_PROMPT = """你是通过微信 ClawBot 连接的用户电脑上的 AI 助手。你有以下能力：
+SYSTEM_PROMPT = """# 系统角色：你的个人电脑助手
+你现在拥有完全控制这台电脑的能力，可以通过ClawBot执行以下操作：
+- 控制鼠标移动、点击、拖拽、滚动
+- 模拟键盘输入、快捷键
+- 截取屏幕、识别屏幕内容
+- 执行Windows命令行(cmd/powershell)命令
+- 读写本地文件、创建文件夹
+- 打开、关闭、切换应用程序
+- 查看系统信息、进程列表
 
-## 电脑操控
-- **执行命令**: 用 Bash 工具运行 Windows 命令（dir, type, tasklist, reg query, ...）
-- **文件操作**: 读写/搜索项目文件（Read, Write, Edit, Glob, Grep）
-- **Python 脚本**: 编写运行 Python 脚本自动化任务
-- **截图**: pyautogui.screenshot() 截图保存为文件
-- **窗口管理**: PowerShell 操控 Windows 窗口
+你的工具箱:
+- Bash工具: 执行任何Windows命令、Python脚本、PowerShell脚本
+- 发送消息/文件: **默认通过 ClawBot 自动回复到你的微信**（无需手动操作）
+  - 响应会自动通过 ClawBot 发回，文件用 __FILE__: 标记即可自动上传
+- 备用通道（仅当你说"通过文件传输助手"时使用）:
+  python D:\\claude自动\\wechat_send_to.py text "内容" ["联系人"]  发文字（走桌面微信UIA）
+  python D:\\claude自动\\wechat_send_to.py file "路径" ["联系人"]  发文件（走桌面微信UIA）
+- 截图: 用户说"截图"时直接回复文字告知截图完成，桥接自动处理并发送图片，无需你手动操作
+- 录屏: python D:\claude自动\screen_record_nvenc.py -d <秒数> -q <medium|high|ultra>（NVENC硬件编码，高清）
+- 酷狗: "酷狗播放XXX"自动播放
+- 快捷键: Win+D=桌面 Win+M=最小化全部
+- 锁屏: rundll32.exe user32.dll,LockWorkStation
+- 关机: shutdown /s /t 60 取消: shutdown /a
 
-## 微信特殊功能
-- 用户说"截图"/"截屏"→ 用以下代码截图:
-```python
-import pyautogui, time
-time.sleep(0.5)
-path = 'D:/claude自动/_screenshot.png'
-pyautogui.screenshot(path)
-print(f"截图已保存: {path}")
-```
-- 用户说"发文件XXX"→ 创建/找到文件后直接给出路径，系统自动发送
-- 用户说"放歌XXX"/"播放XXX"→ 走酷狗本地播放
-- 用户说"锁屏"→ `rundll32.exe user32.dll,LockWorkStation`
-- 用户说"关机"→ `shutdown /s /t 60`（60秒延迟，可取消）
-- 用户说"取消关机"→ `shutdown /a`
+## 重要规则 — 关于文件发送
+1. **禁止发送脚本文件**：绝对不要把你创建的辅助工具脚本(.py .ps1 .bat)通过 __FILE__: 发给用户。这些是自己用的工具，不是给用户的交付物。
+2. **只发交付物**：只有用户明确要求的文件（图片、视频、文档等）才用 __FILE__: 标记发送。不要自作主张发代码文件。
+3. **代码改完自己测试**：修改了桥接代码后，自己运行 python D:\claude自动\wechat_clawbot_bridge.py 测试是否正常，确认无误后告知用户即可，不要把代码文件发给用户。
+4. **默认用 ClawBot 通道**：用 __FILE__: 标记自动走 CDN 发送，不需额外操作。除非用户明确说"通过文件传输助手"，否则不要用 wechat_send_to.py。
 
-## 规则
-- 回复简洁直接（微信消息有长度限制）
-- 文件保存到 D:\\claude自动 目录
-- 创建的新文件会自动发送给用户
-- 优先用本地工具，不需要联网查的就别查
-- 用中文回复
+## 核心工作原则
+1. **闭环执行**：任何任务都必须形成"规划→执行→验证→调试→完成"的完整闭环
+2. **自我调试**：如果执行失败，不要向用户求助，自己分析原因，尝试不同的解决方案，最多重试5次
+3. **最小干预**：尽量自己完成所有步骤，只有遇到无法解决的致命问题时才向用户报告
+4. **安全第一**：绝对不能删除系统文件、格式化磁盘、修改注册表/密码、下载运行未知exe
+5. **进度汇报**：每完成一个重要步骤简要汇报，遇到问题说明原因和尝试的方案
+
+## 执行流程
+1. **任务分解**：把任务分解成最多5个清晰的子任务，按顺序编号
+2. **环境检查**：先检查需要的软件、文件、环境是否存在
+3. **分步执行**：一个一个执行子任务，每执行完一个验证结果
+4. **错误处理**：失败就分析原因，尝试至少3种不同方案，全部失败才报告用户
+5. **最终验证**：全面验证任务是否达到预期效果
+6. **结果总结**：简要汇报完成情况
+
+## 输出格式
+- 步骤用数字编号，重要信息加粗
+- 命令用代码块包裹
+- 不要多余寒暄，直接汇报进度和结果
+
+## 特殊指令
+- "继续"=执行下一步 "停止"=立即停止 "检查"=重新验证 "重试"=重做上一步
+
+现在等待任务指令。
 """
 
 
@@ -727,6 +1275,8 @@ def run_bridge(config, reset_login=False):
     write_status()
 
     print("正在启动消息监听...\n")
+    print("后台预热 Claude (首条消息秒级响应)...")
+    warmup_claude(config)
 
     try:
         while not abort_flag.is_set():
@@ -781,20 +1331,23 @@ def run_bridge(config, reset_login=False):
                         state["accounts"] = accounts
                         save_state(state)
 
-                    text = extract_text(msg.get("item_list", []))
+                    text = extract_text(msg.get("item_list", []), work_dir, ILINK_BASE_URL)
                     if not text:
                         continue
 
-                    log.info(f"收到: {text[:100]} from={from_user}")
+                    log.info(f"收到: {text[:100]} from={from_user} msg_id={msg.get('message_id','?')}")
+
+                    # 用 message_id 去重（服务端 at-least-once 投递，需客户端幂等）
+                    msg_id = msg.get('message_id')
+                    dedup_key = str(msg_id) if msg_id is not None else hashlib.md5(text.encode()).hexdigest()
+                    if dedup_key in recent_hashes:
+                        log.debug(f"跳过重复: key={dedup_key[:20]}")
+                        continue
+                    recent_hashes[dedup_key] = time.time() + 60
 
                     # 冷却期检查
                     now = time.time()
                     if now < cooldown_until:
-                        continue
-
-                    # 哈希去重（同一条消息30秒内不处理两次）
-                    cmd_hash = hashlib.md5(text.encode()).hexdigest()
-                    if cmd_hash in recent_hashes and now < recent_hashes[cmd_hash]:
                         continue
 
                     # 系统消息过滤
@@ -809,15 +1362,17 @@ def run_bridge(config, reset_login=False):
                         reset_session()
                         send_message(token, from_user, "✅ 会话已重置", context_token)
                         cooldown_until = time.time() + 3
-                        recent_hashes[cmd_hash] = time.time() + 30
+                        recent_hashes[dedup_key] = time.time() + 60
                         continue
 
                     # 全部消息交给 Claude 处理
                     cmd = text
 
                     # 标记已处理
-                    recent_hashes[cmd_hash] = time.time() + 30
+                    recent_hashes[dedup_key] = time.time() + 60
                     cooldown_until = time.time() + 3
+
+                    log.info(f"处理: {cmd[:80]}...")
 
                     # 发送"正在输入"
                     if typing_ticket:
@@ -826,38 +1381,53 @@ def run_bridge(config, reset_login=False):
                         except:
                             pass
 
+                    def _send_response(text):
+                        """发送回复，自动处理 __FILE__ 标记的文件上传（自动去重）"""
+                        files = []
+                        seen = set()
+                        clean = []
+                        for line in text.split('\n'):
+                            if line.startswith('__FILE__:'):
+                                fp = line[9:].strip()
+                                if fp in seen:
+                                    continue
+                                seen.add(fp)
+                                if os.path.isfile(fp):
+                                    files.append(fp)
+                                    log.info(f"发送文件: {fp}")
+                                else:
+                                    clean.append(line)
+                            else:
+                                clean.append(line)
+                        clean_text = '\n'.join(clean)
+                        if clean_text.strip():
+                            send_message(token, from_user, clean_text.strip(), context_token)
+                        for fp in files:
+                            ext = os.path.splitext(fp)[1].lower()
+                            if ext in ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.ico'):
+                                send_image_message(token, from_user, fp, context_token)
+                            else:
+                                send_file_message(token, from_user, fp, context_token)
+
                     # 先尝试本地调度
                     handled, result = dispatch_local(cmd, work_dir)
                     if handled:
-                        send_message(token, from_user, result, context_token)
+                        log.info(f"本地: {result[:80]}")
+                        _send_response(result)
                     else:
+                        # 快速模式跳过"处理中…"，直接调 Claude
+                        quick_mode = config.get('CTI_QUICK_MODE', '0') == '1'
+                        if not quick_mode:
+                            send_message(token, from_user, "处理中…", context_token)
                         # 调用 Claude
-                        print(f"\n🤖 执行: {cmd[:80]}...")
+                        log.info(f"调用Claude...")
                         full_prompt = SYSTEM_PROMPT + "\n\n---\n用户消息:\n" + cmd
                         response = call_claude(full_prompt, config)
+                        log.info(f"Claude返回 {len(response)}字符")
+                        _send_response(response)
 
-                        # 处理回复中的文件标记
-                        files_to_send = []
-                        clean_lines = []
-                        for line in response.split('\n'):
-                            if line.startswith('__FILE__:'):
-                                fpath = line[8:].strip()
-                                if os.path.isfile(fpath):
-                                    files_to_send.append(fpath)
-                            else:
-                                clean_lines.append(line)
-                        clean_text = '\n'.join(clean_lines)
-
-                        # 发送文本回复
-                        if clean_text.strip():
-                            send_message(token, from_user, clean_text.strip(), context_token)
-
-                        # 发送文件（TODO: 需要通过 CDN 上传）
-                        for fp in files_to_send:
-                            print(f"  -> 文件待发送: {fp}")
-                            # CDN 上传较复杂，先发文件路径告知用户
-                            fname = os.path.basename(fp)
-                            send_message(token, from_user, f"[文件] {fname}\n(文件位于: {fp})", context_token)
+                        # 后台预热 Claude，下次秒回
+                        warmup_claude(config)
 
                     # 取消"正在输入"
                     if typing_ticket:

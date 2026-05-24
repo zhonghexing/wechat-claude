@@ -43,7 +43,9 @@ Claude 通过微信能操控你的电脑：
 |------|------|
 | 💻 执行命令 | "帮我查看 CPU 温度" / "重启电脑" |
 | 📁 文件操作 | "把桌面整理一下" / "下载这个文件" |
-| 📸 截图 | "截图" / "截屏发给我" |
+| 📸 截图 | "截图" / "截屏发到文件传输助手" |
+| 🎬 录屏 | "录屏30秒" (NVENC硬编码高清) |
+| 💬 桌面微信 | "发消息给XXX说XXX" / "把文件发给XXX" |
 | 🎵 酷狗音乐 | "酷狗播放晴天" |
 | 🔒 锁屏 | "锁屏" |
 | ⚡ 关机 | "关机" (60秒延迟，可取消) |
@@ -56,24 +58,22 @@ Claude 通过微信能操控你的电脑：
   wechat_bridge.py           UIA 桥接（备用）
 
 工具:
+  wechat_send_to.py           桌面微信发送（文字+文件）
+  screen_record_nvenc.py      NVENC 硬件录屏
   wechat_send.py             命令行发消息
   wechat_reply.py            自动回复
-  wechat_send_image.py       粘贴图片
 
 酷狗:
   kugou_play.py              搜索播放
   kugou_calibrate.py         坐标校准
 
 配置:
-  config.env                 统一配置（环境变量 > 文件 > 默认值）
-  .clawbot_state.json        ClawBot 登录凭据 & cursor
+  config.env                 统一配置
+  .clawbot_state.json        ClawBot 登录凭据
 
 启动:
-  启动ClawBot桥接.bat         一键启动 ClawBot
-  安装ClawBot开机自启.bat      ClawBot 开机自启
-  启动桥接.bat                UIA 一键启动
-  安装开机自启.bat            UIA 开机自启
-  卸载开机自启.bat            移除自启
+  启动ClawBot桥接.bat         一键启动
+  安装ClawBot开机自启.bat      开机自启
 ```
 
 ## ClawBot 桥接原理

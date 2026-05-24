@@ -16,17 +16,25 @@ python wechat_clawbot_bridge.py              # 首次扫码登录
 python wechat_clawbot_bridge.py --reset      # 换号/过期重登
 ```
 
-### 消息协议
-- 发任意消息 → Claude 执行 → 微信回复结果
-- 发 `重置` → 清空会话上下文
-- Claude 可：执行命令、读写文件、截图(pyautogui)、锁屏、关机
+### Claude 能力栈
+- **截图**: 本地 PS GDI 截屏，秒级响应。说"截图发到文件传输助手"走桌面微信 UIA 发送
+- **录屏**: RTX 5070 NVENC 硬编码，`screen_record_nvenc.py -d 30 -q high`
+- **桌面微信**: `wechat_send_to.py text/file "内容" ["联系人"]` — UIA 发送消息/文件到任意联系人
+- **酷狗**: "酷狗播放XXX" 本地秒播
+- **执行命令**: Bash/PowerShell/Python 全权限
+- **文件操作**: 读写搜索本地文件
+- **锁屏/关机**: `rundll32.exe user32.dll,LockWorkStation` / `shutdown /s /t 60`
 
 ### 技术要点
 - API: `https://ilinkai.weixin.qq.com`，`iLink-App-Id: bot`
 - 接收: `POST ilink/bot/getupdates` 长轮询（35s），cursor `get_updates_buf` 天然去重
-- 发送: `POST ilink/bot/sendmessage` JSON + `context_token` 上下文回传
+- 发送: `POST ilink/bot/sendmessage` JSON + `context_token`
+- 图片: CDN AES-128-ECB 加密上传 + `image_item` (type=2)
+- 视频: CDN 上传 + `video_item` (type=5)，**不是** `file_item`
+- 关键: `aes_key` = `base64(hex_string)`，不是 `base64(raw_bytes)`，否则图片/视频"已过期"
 - 状态: `.clawbot_state.json`（token+cursor），`runtime/clawbot_bridge.pid`
 - 日志: `logs/clawbot_bridge.log`
+- 依赖: `pip install requests cryptography uiautomation imageio-ffmpeg`
 
 ---
 
@@ -64,11 +72,12 @@ IDLE ──(收到"claude")──→ ACTIVE ──(每条消息)──→ EXECUT
 |------|------|
 | `wechat_clawbot_bridge.py` | ClawBot 桥接主程序（推荐） |
 | `wechat_bridge.py` | UIA 桥接主程序（备用） |
+| `wechat_send_to.py` | 桌面微信 UIA 发送工具（文字+文件） |
+| `screen_record_nvenc.py` | NVENC 硬编码屏幕录制 |
 | `kugou_play.py` | 酷狗音乐搜索播放 |
 | `kugou_calibrate.py` | 酷狗 UI 校准（F8 记录） |
 | `wechat_send.py` | 命令行发消息工具 |
 | `wechat_reply.py` | 自动回复工具 |
-| `wechat_send_image.py` | 粘贴图片工具 |
 | `config.env` | 配置文件（不提交 git） |
 | `.clawbot_state.json` | ClawBot 登录凭据（不提交 git） |
 
