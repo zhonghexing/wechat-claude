@@ -697,7 +697,7 @@ def extract_command(text):
 
 # ---------- 本地指令调度 ----------
 def do_screenshot(work_dir):
-    """用 PowerShell GDI CopyFromScreen 截图（MemoryStream 中转避免中文路径 GDI+ bug）"""
+    """用 PowerShell 高DPI感知 + GDI CopyFromScreen 截图，物理分辨率全像素捕获"""
     ts = int(time.time())
     rand = os.urandom(4).hex()
     path = os.path.join(work_dir, f"_screenshot_{ts}_{rand}.png")
@@ -711,19 +711,26 @@ def do_screenshot(work_dir):
 
     ps_name = f"_clawbot_scr_{rand}.ps1"
     ps_path = os.path.join(tempfile.gettempdir(), ps_name)
+    # SetProcessDPIAware → Bounds 返回物理像素（解决高DPI缩放模糊）
     with open(ps_path, 'w', encoding='utf-8-sig') as f:
         f.write(f'''Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class DPI {{
+    [DllImport("user32.dll")]
+    public static extern bool SetProcessDPIAware();
+}}
+"@
+[DPI]::SetProcessDPIAware() | Out-Null
 Start-Sleep -Milliseconds 200
 $s = [System.Windows.Forms.Screen]::PrimaryScreen
 $b = New-Object System.Drawing.Bitmap($s.Bounds.Width, $s.Bounds.Height)
 $g = [System.Drawing.Graphics]::FromImage($b)
 $g.CopyFromScreen($s.Bounds.X, $s.Bounds.Y, 0, 0, $s.Bounds.Size)
 $g.Dispose()
-$ms = New-Object System.IO.MemoryStream
-$b.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$b.Save("{path}", [System.Drawing.Imaging.ImageFormat]::Png)
 $b.Dispose()
-[System.IO.File]::WriteAllBytes("{path}", $ms.ToArray())
-$ms.Dispose()
 ''')
 
     startupinfo = subprocess.STARTUPINFO()
@@ -865,11 +872,14 @@ def dispatch_local(cmd, work_dir):
     """本地快捷操作（秒级响应，不走 Claude），返回 (handled, result)"""
     cmd_lower = cmd.lower().strip()
 
-    # 截图 — 本地处理，秒级响应。只有"分析/识别图片内容"才走 Claude
+    # 截图 — 本地处理，秒级响应。但"删截图/清理截图"等管理操作交给 Claude 思考
     SCREENSHOT_KW = ['截图', '截屏', '截个图', '屏幕截图', 'screenshot']
     is_screenshot = any(kw in cmd_lower for kw in SCREENSHOT_KW)
+    # 排除非截屏意图：删截图、清理截图、移动截图等
+    SCREENSHOT_NEGATIVE = ['删', '清理', '清除', '去掉', '移出', '移动', '整理', '管理', '多余']
+    is_negative = any(kw in cmd for kw in SCREENSHOT_NEGATIVE)
     needs_analysis = any(kw in cmd for kw in ['分析', '识别', '图片里', '图片中', '图里', '上面写了', '看看'])
-    if is_screenshot and not needs_analysis:
+    if is_screenshot and not needs_analysis and not is_negative:
         # 前置操作：最小化窗口
         if '最小化' in cmd or '隐藏' in cmd:
             import ctypes
@@ -1126,7 +1136,7 @@ SYSTEM_PROMPT = """# 系统角色：你的个人电脑助手
   python D:\\claude自动\\wechat_send_to.py text "内容" ["联系人"]  发文字（走桌面微信UIA）
   python D:\\claude自动\\wechat_send_to.py file "路径" ["联系人"]  发文件（走桌面微信UIA）
 - 截图: 用户说"截图"时直接回复文字告知截图完成，桥接自动处理并发送图片，无需你手动操作
-- 录屏: python D:\claude自动\screen_record_nvenc.py -d <秒数> -q <medium|high|ultra>（NVENC硬件编码，高清）
+- 录屏: python D:\\claude自动\\screen_record_nvenc.py -d <秒数> -q <medium|high|ultra>（NVENC硬件编码，高清）
 - 酷狗: "酷狗播放XXX"自动播放
 - 快捷键: Win+D=桌面 Win+M=最小化全部
 - 锁屏: rundll32.exe user32.dll,LockWorkStation
@@ -1135,7 +1145,7 @@ SYSTEM_PROMPT = """# 系统角色：你的个人电脑助手
 ## 重要规则 — 关于文件发送
 1. **禁止发送脚本文件**：绝对不要把你创建的辅助工具脚本(.py .ps1 .bat)通过 __FILE__: 发给用户。这些是自己用的工具，不是给用户的交付物。
 2. **只发交付物**：只有用户明确要求的文件（图片、视频、文档等）才用 __FILE__: 标记发送。不要自作主张发代码文件。
-3. **代码改完自己测试**：修改了桥接代码后，自己运行 python D:\claude自动\wechat_clawbot_bridge.py 测试是否正常，确认无误后告知用户即可，不要把代码文件发给用户。
+3. **代码改完自己测试**：修改了桥接代码后，自己运行 python D:\\claude自动\\wechat_clawbot_bridge.py 测试是否正常，确认无误后告知用户即可，不要把代码文件发给用户。
 4. **默认用 ClawBot 通道**：用 __FILE__: 标记自动走 CDN 发送，不需额外操作。除非用户明确说"通过文件传输助手"，否则不要用 wechat_send_to.py。
 
 ## 核心工作原则

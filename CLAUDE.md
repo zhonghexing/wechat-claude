@@ -18,7 +18,9 @@ python wechat_clawbot_bridge.py --reset      # 换号/过期重登
 
 ### Claude 能力栈
 - **截图**: 本地 PS GDI 截屏，秒级响应。说"截图发到文件传输助手"走桌面微信 UIA 发送
-- **录屏**: RTX 5070 NVENC 硬编码，`screen_record_nvenc.py -d 30 -q high`
+- **录屏**: RTX 5070 NVENC 硬编码，`screen_record_nvenc.py -d 30 -q high --fps 60`
+  - **默认 HEVC**: 兼容 WMP + 微信（H.264 NVENC SDK 有 pic_struct 协议违规，WMP 拒绝）
+  - 回退 H.264: `--codec h264`（仅微信兼容）
 - **桌面微信**: `wechat_send_to.py text/file "内容" ["联系人"]` — UIA 发送消息/文件到任意联系人
 - **酷狗**: "酷狗播放XXX" 本地秒播
 - **执行命令**: Bash/PowerShell/Python 全权限
@@ -73,7 +75,7 @@ IDLE ──(收到"claude")──→ ACTIVE ──(每条消息)──→ EXECUT
 | `wechat_clawbot_bridge.py` | ClawBot 桥接主程序（推荐） |
 | `wechat_bridge.py` | UIA 桥接主程序（备用） |
 | `wechat_send_to.py` | 桌面微信 UIA 发送工具（文字+文件） |
-| `screen_record_nvenc.py` | NVENC 硬编码屏幕录制 |
+| `screen_record_nvenc.py` | NVENC 硬编码屏幕录制（HEVC/H.264, 30/60fps） |
 | `kugou_play.py` | 酷狗音乐搜索播放 |
 | `kugou_calibrate.py` | 酷狗 UI 校准（F8 记录） |
 | `wechat_send.py` | 命令行发消息工具 |
