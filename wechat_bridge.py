@@ -20,6 +20,10 @@ import os
 import re
 import ctypes
 import hashlib
+import json
+import logging
+import logging.handlers
+import argparse
 
 try:
     import uiautomation as auto
@@ -31,20 +35,118 @@ if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-# ---------- 配置 ----------
-CLAUDE_CLI = r"C:\Users\zhx\Desktop\CC\nodejs\node-v20.11.0-win-x64\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
-WORK_DIR = r"D:\claude自动"
-CHECK_INTERVAL = 0.3
-MAX_RESPONSE_LENGTH = 500
+# ---------- Win32 常量 ----------
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_CONSOLE = 0x00000010
-LOCK_FILE = os.path.join(WORK_DIR, ".bridge_lock")
 SW_RESTORE = 9
 SW_SHOW = 5
 
-# 微信 4.x 文件存储路径
-WECHAT_DATA_DIR = r"C:\Users\zhx\xwechat_files\wxid_tam2qey51fy722_9836"
-WECHAT_FILE_DIR = os.path.join(WECHAT_DATA_DIR, "msg", "file")
+# ---------- 配置加载 ----------
+DEFAULT_CONFIG = {
+    'CTI_CHAT_NAME': '文件传输助手',
+    'CTI_WORK_DIR': os.path.dirname(os.path.abspath(__file__)),
+    'CTI_CLAUDE_CLI': r"C:\Users\zhx\Desktop\CC\nodejs\node-v20.11.0-win-x64\node_modules\@anthropic-ai\claude-code\bin\claude.exe",
+    'CTI_WECHAT_DATA_DIR': r"C:\Users\zhx\xwechat_files\wxid_tam2qey51fy722_9836",
+    'CTI_LOG_DIR': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs'),
+    'CTI_RUNTIME_DIR': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runtime'),
+    'CTI_CHECK_INTERVAL': '0.3',
+    'CTI_MAX_RESPONSE_LENGTH': '500',
+    'CTI_CLAUDE_EFFORT': 'low',
+    'CTI_CLAUDE_TIMEOUT': '300',
+    'CTI_CLAUDE_PERMISSION_MODE': 'bypassPermissions',
+}
+
+
+def parse_env_file(filepath):
+    """解析 .env 格式文件，返回 dict"""
+    result = {}
+    if not os.path.isfile(filepath):
+        return result
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip()
+                if (value.startswith('"') and value.endswith('"')) or \
+                   (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                result[key] = value
+    return result
+
+
+def load_config(config_path=None):
+    """加载配置：环境变量 > config.env 文件 > 默认值"""
+    config = dict(DEFAULT_CONFIG)
+
+    # 自动查找 config.env
+    if config_path is None:
+        search_paths = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.env'),
+            os.path.join(os.path.expanduser('~'), '.wechat-bridge', 'config.env'),
+        ]
+        for p in search_paths:
+            if os.path.isfile(p):
+                config_path = p
+                break
+
+    if config_path and os.path.isfile(config_path):
+        file_config = parse_env_file(config_path)
+        config.update(file_config)
+
+    # 环境变量覆盖
+    for key in config:
+        env_val = os.environ.get(key)
+        if env_val is not None:
+            config[key] = env_val
+
+    return config
+
+
+def setup_logging(log_dir, level=logging.INFO):
+    """配置双输出日志：控制台 + 文件（自动轮转，最多 5 个 × 1MB）"""
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'bridge.log')
+
+    # 根 logger
+    logger = logging.getLogger('wechat_bridge')
+    logger.setLevel(level)
+    logger.handlers.clear()
+
+    # 控制台
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(level)
+    ch.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+    logger.addHandler(ch)
+
+    # 文件轮转
+    fh = logging.handlers.RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=5,
+                                               encoding='utf-8')
+    fh.setLevel(level)
+    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(fh)
+
+    return logger
+
+
+def write_runtime_status(runtime_dir, **kwargs):
+    """写入运行时状态 JSON"""
+    os.makedirs(runtime_dir, exist_ok=True)
+    status = {
+        'pid': os.getpid(),
+        'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    status.update(kwargs)
+    path = os.path.join(runtime_dir, 'status.json')
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+    except:
+        pass
 
 # 消息类型
 MSG_TEXT = 'text'
@@ -52,25 +154,32 @@ MSG_IMAGE = 'image'
 MSG_FILE = 'file'
 
 # ---------- 状态机 ----------
-STATE_IDLE = "idle"            # 静默监控中
-STATE_ACTIVE = "active"        # 指令模式，每条消息当指令执行
-STATE_EXECUTE = "execute"      # 执行中
+STATE_IDLE = "idle"
+STATE_ACTIVE = "active"
+STATE_EXECUTE = "execute"
 
 # ---------- 单实例锁 + 旧进程清理 ----------
 
-CLAUDE_PID_FILE = os.path.join(WORK_DIR, ".claude_pids")
+# 运行时全局变量（由 run_bridge 初始化）
+_G = {}
 
 # 当前桥接实例启动后才创建的 Claude 子进程 PID（用于正常退出时精确清理）
 _my_claude_pids = []
 
 
+def c(path_key):
+    """从 _G 配置中获取路径"""
+    return _G.get(path_key, '')
+
+
 def cleanup_stale_claude():
     """启动时：杀死上次桥接残留的所有 Claude 子进程"""
-    if not os.path.exists(CLAUDE_PID_FILE):
+    pid_file = c('CLAUDE_PID_FILE')
+    if not pid_file or not os.path.exists(pid_file):
         return
     killed = 0
     try:
-        with open(CLAUDE_PID_FILE, 'r') as f:
+        with open(pid_file, 'r') as f:
             pids = [line.strip() for line in f if line.strip()]
         kernel32 = ctypes.windll.kernel32
         for pid_str in pids:
@@ -86,7 +195,7 @@ def cleanup_stale_claude():
     except:
         pass
     try:
-        os.remove(CLAUDE_PID_FILE)
+        os.remove(pid_file)
     except:
         pass
     if killed:
@@ -96,11 +205,13 @@ def cleanup_stale_claude():
 def track_claude_pid(pid):
     """记录 Claude 子进程 PID，以便异常退出后清理"""
     _my_claude_pids.append(pid)
-    try:
-        with open(CLAUDE_PID_FILE, 'a') as f:
-            f.write(f"{pid}\n")
-    except:
-        pass
+    pid_file = c('CLAUDE_PID_FILE')
+    if pid_file:
+        try:
+            with open(pid_file, 'a') as f:
+                f.write(f"{pid}\n")
+        except:
+            pass
 
 
 def untrack_claude_pid(pid):
@@ -121,18 +232,23 @@ def kill_my_claude():
         except:
             pass
     _my_claude_pids.clear()
-    try:
-        if os.path.exists(CLAUDE_PID_FILE):
-            os.remove(CLAUDE_PID_FILE)
-    except:
-        pass
+    pid_file = c('CLAUDE_PID_FILE')
+    if pid_file:
+        try:
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+        except:
+            pass
 
 
 def acquire_lock():
     """获取单实例锁，如发现旧桥接进程则自动杀死并接管"""
-    if os.path.exists(LOCK_FILE):
+    lock_file = c('LOCK_FILE')
+    if not lock_file:
+        return True
+    if os.path.exists(lock_file):
         try:
-            with open(LOCK_FILE, 'r') as f:
+            with open(lock_file, 'r') as f:
                 old_pid = int(f.read().strip())
             kernel32 = ctypes.windll.kernel32
             h = kernel32.OpenProcess(0x0001, False, old_pid)
@@ -144,22 +260,24 @@ def acquire_lock():
         except:
             pass
         try:
-            os.remove(LOCK_FILE)
+            os.remove(lock_file)
         except:
             pass
     cleanup_stale_claude()
-    with open(LOCK_FILE, 'w') as f:
+    with open(lock_file, 'w') as f:
         f.write(str(os.getpid()))
     return True
 
 
 def release_lock():
     kill_my_claude()
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-    except:
-        pass
+    lock_file = c('LOCK_FILE')
+    if lock_file:
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+        except:
+            pass
 
 
 # ---------- 窗口管理 ----------
@@ -414,7 +532,7 @@ def capture_images_from_chat(wechat):
         try:
             img = _pg.screenshot(region=(rect.left, rect.top,
                                          max(rect.width(), 1), max(rect.height(), 1)))
-            path = os.path.join(WORK_DIR, f"_wechat_img_{ts}_{i}.png")
+            path = os.path.join(c('WORK_DIR'), f"_wechat_img_{ts}_{i}.png")
             img.save(path)
             saved.append(path)
         except Exception as _e:
@@ -425,7 +543,7 @@ def capture_images_from_chat(wechat):
 def find_latest_files(n=3):
     """查找微信文件存储目录中最新的 n 个文件"""
     month = time.strftime('%Y-%m')
-    file_dir = os.path.join(WECHAT_FILE_DIR, month)
+    file_dir = os.path.join(c('WECHAT_FILE_DIR'), month)
     if not os.path.isdir(file_dir):
         return []
     files = []
@@ -599,9 +717,9 @@ def dispatch_local(cmd):
         m = _re.search(r'^发(?:送)?(?:文件|图片)\s+(.+?)(?:\s*stop)?\s*$', cmd)
         if m:
             fname = m.group(1).strip()
-            fpath = os.path.join(WORK_DIR, fname)
+            fpath = os.path.join(c('WORK_DIR'), fname)
             if not os.path.isfile(fpath):
-                fpath = fname  # 尝试绝对路径
+                fpath = fname
             if os.path.isfile(fpath):
                 return True, ('__SEND_FILE__', fpath)
             else:
@@ -626,9 +744,9 @@ def dispatch_local(cmd):
         if song:
             try:
                 r = subprocess.run(
-                    ['python', '-u', os.path.join(WORK_DIR, 'kugou_play.py'), song],
+                    ['python', '-u', os.path.join(c('WORK_DIR'), 'kugou_play.py'), song],
                     capture_output=True, text=True, timeout=30,
-                    cwd=WORK_DIR, encoding='utf-8', errors='replace',
+                    cwd=c('WORK_DIR'), encoding='utf-8', errors='replace',
                     creationflags=CREATE_NO_WINDOW,
                 )
                 return True, f"酷狗: {song}\n{r.stdout.strip()[-300:] if r.stdout else '(无输出)'}"
@@ -662,9 +780,12 @@ def warmup_claude():
     """后台启动 Claude 预热会话，用户打字期间完成冷启动"""
     global _session_started, _prime_proc
     if _prime_proc is not None and _prime_proc.poll() is None:
-        return  # 已有预热进程在运行
+        return
     try:
-        args = [CLAUDE_CLI, '-p', '回复OK', '--permission-mode', 'bypassPermissions', '--effort', 'low']
+        cli = c('CLAUDE_CLI')
+        effort = _G.get('CTI_CLAUDE_EFFORT', 'low')
+        perm = _G.get('CTI_CLAUDE_PERMISSION_MODE', 'bypassPermissions')
+        args = [cli, '-p', '回复OK', '--permission-mode', perm, '--effort', effort]
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 6
@@ -672,7 +793,7 @@ def warmup_claude():
             args,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            cwd=WORK_DIR, creationflags=CREATE_NEW_CONSOLE,
+            cwd=c('WORK_DIR'), creationflags=CREATE_NEW_CONSOLE,
             startupinfo=startupinfo,
         )
         track_claude_pid(_prime_proc.pid)
@@ -684,7 +805,14 @@ def call_claude(prompt):
     """后台调用 Claude，自动保持会话连贯，自动检测 Claude 创建的新文件"""
     global _session_started, _prime_proc
 
-    # 检查后台预热：已完成则复用会话，未完成则杀掉（同一时间只允许一个 Claude 实例）
+    cli = c('CLAUDE_CLI')
+    work_dir = c('WORK_DIR')
+    effort = _G.get('CTI_CLAUDE_EFFORT', 'low')
+    perm = _G.get('CTI_CLAUDE_PERMISSION_MODE', 'bypassPermissions')
+    timeout_s = int(_G.get('CTI_CLAUDE_TIMEOUT', '300'))
+    max_len = int(_G.get('CTI_MAX_RESPONSE_LENGTH', '500'))
+
+    # 检查后台预热：已完成则复用会话，未完成则杀掉
     if _prime_proc is not None:
         if _prime_proc.poll() is None:
             try:
@@ -693,44 +821,45 @@ def call_claude(prompt):
                 pass
             untrack_claude_pid(_prime_proc.pid)
         else:
-            _session_started = True  # 预热好了，用 --continue
+            _session_started = True
             untrack_claude_pid(_prime_proc.pid)
         _prime_proc = None
 
-    # 记录执行前的文件快照，Claude 执行后自动发送新增的图片/文件
+    # 记录执行前的文件快照
     existing_files = set()
     try:
-        for f in os.listdir(WORK_DIR):
+        for f in os.listdir(work_dir):
             existing_files.add(f)
     except:
         pass
 
     try:
         if _session_started:
-            args = [CLAUDE_CLI, '--continue', '-p', prompt, '--permission-mode', 'bypassPermissions', '--effort', 'low']
+            args = [cli, '--continue', '-p', prompt, '--permission-mode', perm, '--effort', effort]
         else:
-            args = [CLAUDE_CLI, '-p', prompt, '--permission-mode', 'bypassPermissions', '--effort', 'low']
+            args = [cli, '-p', prompt, '--permission-mode', perm, '--effort', effort]
             _session_started = True
 
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 6  # SW_MINIMIZE
+        startupinfo.wShowWindow = 6
         proc = subprocess.Popen(
             args,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding='utf-8', errors='replace',
-            cwd=WORK_DIR, creationflags=CREATE_NEW_CONSOLE,
+            cwd=work_dir, creationflags=CREATE_NEW_CONSOLE,
             startupinfo=startupinfo,
         )
         track_claude_pid(proc.pid)
         try:
-            stdout, stderr_text = proc.communicate(timeout=300)
+            stdout, stderr_text = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
             untrack_claude_pid(proc.pid)
-            return "(Claude 执行超时，5分钟未完成)"
+            return "(Claude 执行超时)"
+
         untrack_claude_pid(proc.pid)
 
         output = stdout.strip()
@@ -741,40 +870,76 @@ def call_claude(prompt):
         if not output:
             output = f"(无输出, exit={proc.returncode})"
 
-        # 检测 Claude 执行过程中创建的新文件（截图等），自动发送
+        # 检测新文件
         try:
-            for f in os.listdir(WORK_DIR):
-                if f not in existing_files and os.path.isfile(os.path.join(WORK_DIR, f)):
-                    output += f"\n__FILE__:{os.path.join(WORK_DIR, f)}"
+            for f in os.listdir(work_dir):
+                if f not in existing_files and os.path.isfile(os.path.join(work_dir, f)):
+                    output += f"\n__FILE__:{os.path.join(work_dir, f)}"
         except:
             pass
 
-        return output[:MAX_RESPONSE_LENGTH + 500]  # 允许略超限制以容纳文件路径
+        return output[:max_len + 500]
     except subprocess.TimeoutExpired:
-        return "(Claude 执行超时，5分钟未完成)"
+        return "(Claude 执行超时)"
     except FileNotFoundError:
-        return f"(未找到 Claude CLI: {CLAUDE_CLI})"
+        return f"(未找到 Claude CLI: {cli})"
     except Exception as e:
         return f"(调用失败: {e})"
 
 
 # ---------- 主循环 ----------
 
-def run_bridge(chat_name="文件传输助手"):
+def run_bridge(chat_name=None, config=None):
+    global _G
+
+    # 加载配置
+    if config is None:
+        config = load_config()
+    work_dir = config.get('CTI_WORK_DIR', os.path.dirname(os.path.abspath(__file__)))
+    runtime_dir = config.get('CTI_RUNTIME_DIR', os.path.join(work_dir, 'runtime'))
+    log_dir = config.get('CTI_LOG_DIR', os.path.join(work_dir, 'logs'))
+    check_interval = float(config.get('CTI_CHECK_INTERVAL', '0.3'))
+    chat_name = chat_name or config.get('CTI_CHAT_NAME', '文件传输助手')
+    wechat_data_dir = config.get('CTI_WECHAT_DATA_DIR', '')
+
+    # 设置 _G（供 c() 函数使用）
+    _G = {
+        'CLAUDE_CLI': config.get('CTI_CLAUDE_CLI', ''),
+        'WORK_DIR': work_dir,
+        'CTI_CLAUDE_EFFORT': config.get('CTI_CLAUDE_EFFORT', 'low'),
+        'CTI_CLAUDE_PERMISSION_MODE': config.get('CTI_CLAUDE_PERMISSION_MODE', 'bypassPermissions'),
+        'CTI_CLAUDE_TIMEOUT': config.get('CTI_CLAUDE_TIMEOUT', '300'),
+        'CTI_MAX_RESPONSE_LENGTH': config.get('CTI_MAX_RESPONSE_LENGTH', '500'),
+        'LOCK_FILE': os.path.join(work_dir, '.bridge_lock'),
+        'CLAUDE_PID_FILE': os.path.join(work_dir, '.claude_pids'),
+        'WECHAT_FILE_DIR': os.path.join(wechat_data_dir, 'msg', 'file') if wechat_data_dir else '',
+    }
+
+    # 日志
+    logger = setup_logging(log_dir)
+
+    # 运行时状态
+    write_runtime_status(runtime_dir, state='starting', chat_name=chat_name)
+    _G['RUNTIME_DIR'] = runtime_dir
+
     if not acquire_lock():
+        logger.error("无法获取单实例锁")
         return
+
+    logger.info(f"桥接启动: chat={chat_name}, work_dir={work_dir}")
 
     wechat = None
     state = STATE_IDLE
-    last_fingerprint = None      # cell 完整 Name（含时间戳），用于新消息检测
-    last_processed_text = None   # 上次处理的消息正文，防止重复处理
-    cooldown_until = 0           # 冷却期：处理指令后短暂忽略所有消息，防止 Claude 动作的回声
-    recent_hashes = {}           # cmd_hash → expire_time，内容级去重，防止同一条指令被处理两次
+    last_fingerprint = None
+    last_processed_text = None
+    cooldown_until = 0
+    recent_hashes = {}
 
     print("=" * 60)
     print("WeChat <-> Claude 桥接系统")
     print(f"  监控对象: {chat_name}")
-    print(f"  收到指令时自动弹出 Claude 终端窗口")
+    print(f"  工作目录: {work_dir}")
+    print(f"  日志目录: {log_dir}")
     print()
     print("状态机: IDLE → (收到claude) → ACTIVE → (每条消息=指令) → EXECUTE → ACTIVE")
     print("按 Ctrl+C 停止")
@@ -832,7 +997,7 @@ def run_bridge(chat_name="文件传输助手"):
 
     try:
         while True:
-            time.sleep(CHECK_INTERVAL)
+            time.sleep(check_interval)
 
             # 连接微信
             if not wechat or not wechat.Exists(0, 0.3):
@@ -876,6 +1041,7 @@ def run_bridge(chat_name="文件传输助手"):
             recent_hashes = {h: exp for h, exp in recent_hashes.items() if exp > now}
 
             print(f"[{time.strftime('%H:%M:%S')}] [{state}] 收到: {current}")
+            logger.info(f"[{state}] 收到: {current}")
 
             # --- IDLE 状态：等待 claude 进入指令模式 ---
             if state == STATE_IDLE:
@@ -989,19 +1155,33 @@ def run_bridge(chat_name="文件传输助手"):
     except KeyboardInterrupt:
         print()
         print("桥接系统已停止")
+        logger.info("桥接系统已停止 (KeyboardInterrupt)")
         return
     except Exception as e:
-        print(f"运行出错(3秒后自动重启): {e}")
+        msg = f"运行出错(3秒后自动重启): {e}"
+        print(msg)
         import traceback
         traceback.print_exc()
+        logger.error(msg)
+        logger.error(traceback.format_exc())
     finally:
         release_lock()
+        write_runtime_status(runtime_dir, state='stopped', chat_name=chat_name)
 
 
 def main():
-    chat_name = sys.argv[1] if len(sys.argv) > 1 else "文件传输助手"
+    parser = argparse.ArgumentParser(description='WeChat <-> Claude 桥接系统')
+    parser.add_argument('chat_name', nargs='?', default=None,
+                        help='监控的微信联系人名称（默认: 文件传输助手）')
+    parser.add_argument('--config', '-c', default=None,
+                        help='配置文件路径（默认: 自动查找 config.env）')
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    chat_name = args.chat_name or config.get('CTI_CHAT_NAME', '文件传输助手')
+
     while True:
-        run_bridge(chat_name)
+        run_bridge(chat_name, config=config)
         print("桥接已退出，3秒后自动重启...")
         time.sleep(3)
 
