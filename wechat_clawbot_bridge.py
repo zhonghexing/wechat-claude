@@ -50,6 +50,14 @@ try:
 except ImportError:
     PYAUTOGUI = False
 
+try:
+    import dxcam
+    import numpy as np
+    from PIL import Image
+    DXCAM_AVAILABLE = True
+except ImportError:
+    DXCAM_AVAILABLE = False
+
 # ---------- 编码修复 ----------
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -706,11 +714,12 @@ def extract_command(text):
 
 # ---------- 本地指令调度 ----------
 def do_screenshot(work_dir):
-    """用 PowerShell 高DPI感知 + GDI CopyFromScreen 截图，物理分辨率全像素捕获"""
+    """用 DXGI (DirectX) 截图，支持 HDR 显示器，正确做 HDR→sRGB 色调映射；
+    失败时回退到 PowerShell GDI CopyFromScreen"""
     ts = int(time.time())
     rand = os.urandom(4).hex()
     path = os.path.join(work_dir, f"_screenshot_{ts}_{rand}.png")
-    # 清理旧截图（只清理非当前文件）
+    # 清理旧截图
     for f in os.listdir(work_dir):
         if f.startswith("_screenshot") and f.endswith(".png") and f != os.path.basename(path):
             try:
@@ -718,6 +727,25 @@ def do_screenshot(work_dir):
             except:
                 pass
 
+    # 方案1：DXGI（支持 HDR）
+    if DXCAM_AVAILABLE:
+        try:
+            camera = dxcam.create(output_color="RGB")
+            frame = camera.grab()
+            if frame is None:
+                time.sleep(0.3)
+                frame = camera.grab()
+            if frame is not None:
+                Image.fromarray(frame).save(path, "PNG")
+                camera.release()
+                if os.path.isfile(path) and os.path.getsize(path) > 1024:
+                    log.info(f"DXGI截图成功（支持HDR）: {path}")
+                    return path
+            camera.release()
+        except Exception as e:
+            log.warning(f"DXGI截图失败 ({e})，回退到 GDI")
+
+    # 方案2：PowerShell GDI（旧方法，HDR 会过曝）
     ps_name = f"_clawbot_scr_{rand}.ps1"
     ps_path = os.path.join(tempfile.gettempdir(), ps_name)
     # SetProcessDPIAware → Bounds 返回物理像素（解决高DPI缩放模糊）
