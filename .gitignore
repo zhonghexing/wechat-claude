@@ -24,8 +24,9 @@ __pycache__/
 *.jpeg
 !screenshots/
 
-# Screen recordings
+# Screen recordings & test videos
 _record_*.mp4
+_test*.mp4
 
 # Temp diagnostic scripts
 _debug_*.py
@@ -40,6 +41,15 @@ ffmpeg*.zip
 
 # ClawBot temp PS1
 _screenshot.ps1
+
+# FFmpeg logs
+_ffmpeg_log.txt
+
+# Desktop recordings
+Desktop *.mp4
+
+# Windows shortcuts
+*.lnk
 
 # OS
 Thumbs.db

@@ -393,6 +393,11 @@ def _download_cdn_media(media: dict, base_url: str) -> bytes | None:
     param = media.get("encrypt_query_param", "")
     aeskey_str = media.get("aeskey", "")
     if not filekey or not param or not aeskey_str:
+        missing = []
+        if not filekey: missing.append("filekey")
+        if not param: missing.append("encrypt_query_param")
+        if not aeskey_str: missing.append("aeskey")
+        log.warning(f"_download_cdn_media: 缺少字段 {missing}, media_keys={list(media.keys())}")
         return None
 
     # aeskey 兼容 hex（32 字符）和 base64（24 字符）两种编码
@@ -664,7 +669,11 @@ def extract_text(item_list, work_dir=".", base_url=ILINK_BASE_URL):
             if text:
                 return f"[语音] {text}"
         if item.get("type") == 2:  # IMAGE
-            media = item.get("image_item", {}).get("media", {})
+            image_item = item.get("image_item", {})
+            log.info(f"[DEBUG] IMAGE item keys={list(image_item.keys())}, raw={str(image_item)[:300]}")
+            media = image_item.get("media", {})
+            if media:
+                log.info(f"[DEBUG] media keys={list(media.keys())}, filekey={media.get('filekey','')[:30]}")
             fp = _download_and_save_image(media, work_dir, base_url)
             if fp:
                 return f"[图片] __FILE__:{fp}"
